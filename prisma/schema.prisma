@@ -436,6 +436,7 @@ model RefundLine {
 
 model CustomerPayment {
   id         String        @id @default(cuid())
+  receiptNo  Int           @unique @default(autoincrement())
   customerId String
   customer   Customer      @relation(fields: [customerId], references: [id])
   amount     Float
