@@ -51,30 +51,17 @@ fi
 
 export DATABASE_URL DIRECT_URL
 
-# Neon free tier sleeps when idle; wake it before migrate.
-echo "Waking database…"
-printf 'SELECT 1;\n' | npx prisma db execute --stdin --url "$DIRECT_URL" >/dev/null 2>&1 || true
-sleep 3
+# Migrations: run from your laptop (`npx prisma migrate deploy`) after schema changes.
+# Running migrate on every Vercel build causes P1002 advisory-lock timeouts (parallel deploys + Neon sleep).
+# Set RUN_MIGRATE=1 in Vercel env only when you intentionally want migrate during build.
+if [ "${RUN_MIGRATE:-}" = "1" ]; then
+  echo "RUN_MIGRATE=1 — waking DB and applying migrations…"
+  printf 'SELECT 1;\n' | npx prisma db execute --stdin --url "$DIRECT_URL" >/dev/null 2>&1 || true
+  sleep 2
+  npx prisma migrate deploy
+else
+  echo "Skipping migrate on Vercel (schema already applied locally). Set RUN_MIGRATE=1 to enable."
+fi
 
-# Parallel Vercel deploys contend for Prisma's migrate advisory lock (P1002). Retry.
-migrate_with_retry() {
-  attempt=1
-  max=6
-  while [ "$attempt" -le "$max" ]; do
-    echo "prisma migrate deploy (attempt $attempt/$max)…"
-    if npx prisma migrate deploy; then
-      return 0
-    fi
-    wait=$((attempt * 8))
-    echo "Migrate failed (often P1002 lock timeout). Waiting ${wait}s…"
-    sleep "$wait"
-    attempt=$((attempt + 1))
-  done
-  echo "error: prisma migrate deploy failed after $max attempts" >&2
-  echo "hint: Cancel other in-progress Vercel deployments, wait 1 minute, redeploy once." >&2
-  return 1
-}
-
-migrate_with_retry
 npx prisma generate
 npx next build
