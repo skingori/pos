@@ -1,0 +1,456 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Neon / Vercel: pooled URL in DATABASE_URL, direct (non-pooler) in DIRECT_URL.
+  // Local: set both to the same connection string.
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  ATTENDANT
+}
+
+enum SaleStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentMethod {
+  CASH
+  MPESA
+  CREDIT
+  CARD
+  BANK
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum CashMovementType {
+  IN
+  OUT
+}
+
+enum ReturnCondition {
+  SELLABLE
+  OPENED
+  WRITE_OFF
+}
+
+model ShopSettings {
+  id                   String  @id @default("default")
+  shopName             String  @default("Kenya Hardware")
+  defaultMarkupPercent Float   @default(25)
+  vatPercent           Float   @default(16)
+  pricesIncludeVat     Boolean @default(true)
+  currency             String  @default("KES")
+  address              String?
+  phone                String?
+  kraPin               String?
+  receiptFooter        String  @default("Thank you for your business!")
+}
+
+enum PurchaseStatus {
+  DRAFT
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+model Branch {
+  id        String        @id @default(cuid())
+  code      String        @unique
+  name      String
+  address   String?
+  city      String?
+  country   String?
+  phone     String?
+  active    Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  users     User[]
+  sessions  PosSession[]
+  sales     Sale[]
+  purchases Purchase[]
+  stocks    BranchStock[]
+  serials   SerialUnit[]
+}
+
+model BranchStock {
+  id           String  @id @default(cuid())
+  branchId     String
+  branch       Branch  @relation(fields: [branchId], references: [id])
+  productId    String
+  product      Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  qty          Float   @default(0)
+  openedQty    Float   @default(0)
+  reorderLevel Float   @default(0)
+
+  @@unique([branchId, productId])
+  @@index([productId])
+}
+
+model PriceLevel {
+  id              String     @id @default(cuid())
+  name            String     @unique
+  discountPercent Float      @default(0)
+  active          Boolean    @default(true)
+  customers       Customer[]
+}
+
+model Promotion {
+  id         String    @id @default(cuid())
+  name       String
+  percentOff Float
+  productId  String?
+  product    Product?  @relation(fields: [productId], references: [id])
+  active     Boolean   @default(true)
+  startsAt   DateTime?
+  endsAt     DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+model User {
+  id                 String          @id @default(cuid())
+  name               String
+  email              String          @unique
+  passwordHash       String
+  role               Role            @default(ATTENDANT)
+  active             Boolean         @default(true)
+  mustChangePassword Boolean         @default(false)
+  branchId           String?
+  branch             Branch?         @relation(fields: [branchId], references: [id])
+  createdAt          DateTime        @default(now())
+  sales              Sale[]
+  sessions           PosSession[]  @relation("PosSessionOpenedBy")
+  sessionsClosed     PosSession[]  @relation("PosSessionClosedBy")
+  cashMoves          CashMovement[]
+  refundsReq         RefundRequest[] @relation("RefundRequester")
+  refundsRev         RefundRequest[] @relation("RefundReviewer")
+  auditLogs          AuditLog[]
+  purchases          Purchase[]
+}
+
+model Category {
+  id       String    @id @default(cuid())
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id              String         @id @default(cuid())
+  name            String
+  sku             String         @unique
+  barcode         String?        @unique
+  categoryId      String?
+  category        Category?      @relation(fields: [categoryId], references: [id])
+  cost            Float          @default(0)
+  sellPrice       Float
+  unit            String         @default("pc")
+  imageUrl        String?
+  trackSerial     Boolean        @default(false)
+  isReturnSku     Boolean        @default(false)
+  parentProductId String?
+  parentProduct   Product?       @relation("ReturnSkus", fields: [parentProductId], references: [id])
+  returnSkus      Product[]      @relation("ReturnSkus")
+  active          Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  saleLines       SaleLine[]
+  purchaseLines   PurchaseLine[]
+  refundLines     RefundLine[]
+  promotions      Promotion[]
+  serials         SerialUnit[]
+  stocks          BranchStock[]
+}
+
+enum SerialStatus {
+  IN_STOCK
+  SOLD
+  RETURNED
+  WRITTEN_OFF
+}
+
+model SerialUnit {
+  id        String       @id @default(cuid())
+  productId String
+  product   Product      @relation(fields: [productId], references: [id])
+  branchId  String?
+  branch    Branch?      @relation(fields: [branchId], references: [id])
+  serial    String
+  status    SerialStatus @default(IN_STOCK)
+  saleId    String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@unique([productId, serial])
+  @@index([serial])
+  @@index([branchId])
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+  COGS
+}
+
+model Account {
+  id     String        @id @default(cuid())
+  code   String        @unique
+  name   String
+  type   AccountType
+  active Boolean       @default(true)
+  lines  JournalLine[]
+}
+
+model JournalEntry {
+  id         String        @id @default(cuid())
+  date       DateTime      @default(now())
+  memo       String
+  sourceType String
+  sourceId   String?
+  createdAt  DateTime      @default(now())
+  lines      JournalLine[]
+
+  @@index([sourceType, sourceId])
+}
+
+model JournalLine {
+  id        String       @id @default(cuid())
+  entryId   String
+  entry     JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  accountId String
+  account   Account      @relation(fields: [accountId], references: [id])
+  debit     Float        @default(0)
+  credit    Float        @default(0)
+}
+
+model Customer {
+  id           String            @id @default(cuid())
+  name         String
+  phone        String?
+  email        String?
+  creditLimit  Float             @default(0)
+  balance      Float             @default(0)
+  priceLevelId String?
+  priceLevel   PriceLevel?       @relation(fields: [priceLevelId], references: [id])
+  active       Boolean           @default(true)
+  createdAt    DateTime          @default(now())
+  sales        Sale[]
+  payments     CustomerPayment[]
+}
+
+model Supplier {
+  id        String     @id @default(cuid())
+  name      String
+  phone     String?
+  email     String?
+  active    Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  purchases Purchase[]
+}
+
+model Purchase {
+  id         String         @id @default(cuid())
+  supplierId String?
+  supplier   Supplier?      @relation(fields: [supplierId], references: [id])
+  userId     String
+  user       User           @relation(fields: [userId], references: [id])
+  branchId   String?
+  branch     Branch?        @relation(fields: [branchId], references: [id])
+  status     PurchaseStatus @default(RECEIVED)
+  note       String?
+  totalCost  Float          @default(0)
+  orderedAt  DateTime?
+  receivedAt DateTime?
+  createdAt  DateTime       @default(now())
+  lines      PurchaseLine[]
+}
+
+model PurchaseLine {
+  id         String   @id @default(cuid())
+  purchaseId String
+  purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  qty        Float
+  unitCost   Float
+}
+
+model PosSession {
+  id              String          @id @default(cuid())
+  status          SessionStatus   @default(OPEN)
+  branchId        String
+  branch          Branch          @relation(fields: [branchId], references: [id])
+  openedById      String
+  openedBy        User            @relation("PosSessionOpenedBy", fields: [openedById], references: [id])
+  closedById      String?
+  closedBy        User?           @relation("PosSessionClosedBy", fields: [closedById], references: [id])
+  openingFloat    Float           @default(0)
+  closedAt        DateTime?
+  expectedCash    Float?
+  countedCash     Float?
+  expectedMpesa   Float?
+  countedMpesa    Float?
+  cashDifference  Float?
+  mpesaDifference Float?
+  note            String?
+  createdAt       DateTime        @default(now())
+  sales           Sale[]
+  movements       CashMovement[]
+  refunds         RefundRequest[]
+
+  @@index([branchId, status])
+}
+
+model CashMovement {
+  id        String           @id @default(cuid())
+  sessionId String
+  session   PosSession       @relation(fields: [sessionId], references: [id])
+  userId    String
+  user      User             @relation(fields: [userId], references: [id])
+  type      CashMovementType
+  amount    Float
+  note      String?
+  createdAt DateTime         @default(now())
+}
+
+model Sale {
+  id          String          @id @default(cuid())
+  receiptNo   Int             @unique @default(autoincrement())
+  status      SaleStatus      @default(PENDING)
+  customerId  String?
+  customer    Customer?       @relation(fields: [customerId], references: [id])
+  cashierId   String
+  cashier     User            @relation(fields: [cashierId], references: [id])
+  branchId    String?
+  branch      Branch?         @relation(fields: [branchId], references: [id])
+  sessionId   String?
+  session     PosSession?     @relation(fields: [sessionId], references: [id])
+  subtotal    Float           @default(0)
+  discount    Float           @default(0)
+  taxRate     Float           @default(0)
+  taxAmount   Float           @default(0)
+  total       Float           @default(0)
+  costTotal   Float           @default(0)
+  note                String?
+  creditDueAt         DateTime?
+  creditBalanceBefore Float?
+  createdAt           DateTime        @default(now())
+  completedAt         DateTime?
+  lines       SaleLine[]
+  payments    Payment[]
+  refunds     RefundRequest[]
+
+  @@index([branchId])
+}
+
+model SaleLine {
+  id        String  @id @default(cuid())
+  saleId    String
+  sale      Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  name      String
+  unit      String
+  qty       Float
+  unitPrice Float
+  discount  Float   @default(0)
+  lineTotal Float
+  unitCost  Float   @default(0)
+  serials   Json?
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  saleId          String
+  sale            Sale          @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method          PaymentMethod
+  amount          Float
+  status          PaymentStatus @default(PENDING)
+  mpesaCheckoutId String?
+  mpesaReceipt    String?
+  mpesaPhone      String?
+  createdAt       DateTime      @default(now())
+}
+
+model RefundRequest {
+  id           String         @id @default(cuid())
+  saleId       String
+  sale         Sale           @relation(fields: [saleId], references: [id])
+  requesterId  String
+  requester    User           @relation("RefundRequester", fields: [requesterId], references: [id])
+  reviewerId   String?
+  reviewer     User?          @relation("RefundReviewer", fields: [reviewerId], references: [id])
+  status       RefundStatus   @default(PENDING)
+  reason       String?
+  amount       Float          @default(0)
+  payoutMethod PaymentMethod  @default(CASH)
+  mpesaRef     String?
+  sessionId    String?
+  session      PosSession?    @relation(fields: [sessionId], references: [id])
+  createdAt    DateTime       @default(now())
+  reviewedAt   DateTime?
+  lines        RefundLine[]
+}
+
+model RefundLine {
+  id        String          @id @default(cuid())
+  refundId  String
+  refund    RefundRequest   @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product         @relation(fields: [productId], references: [id])
+  qty       Float
+  amount    Float
+  condition ReturnCondition @default(SELLABLE)
+  unitCost  Float           @default(0)
+  serials   Json?
+}
+
+model CustomerPayment {
+  id         String        @id @default(cuid())
+  customerId String
+  customer   Customer      @relation(fields: [customerId], references: [id])
+  amount     Float
+  method     PaymentMethod @default(CASH)
+  note       String?
+  createdAt  DateTime      @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  detail    String?
+  createdAt DateTime @default(now())
+}

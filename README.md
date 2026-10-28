@@ -1,36 +1,42 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kenya Hardware POS
 
-## Getting Started
+Stockflow-like point of sale for a Kenyan hardware shop.
 
-First, run the development server:
+## Setup
 
 ```bash
+cp .env.example .env
+docker compose up -d   # Postgres on localhost:5433
+npm install
+npm run db:setup
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+> Local Postgres already on 5432? Compose maps the container to **5433** (see `DATABASE_URL` / `DIRECT_URL` in `.env`).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Open [http://localhost:3000](http://localhost:3000).
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### Demo on Vercel + Neon
 
-## Learn More
+See [`docs/demo-vercel.md`](docs/demo-vercel.md). Uses `vercel.json` + `npm run vercel-build` (migrate + build).
 
-To learn more about Next.js, take a look at the following resources:
+### Default users (dev)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Email | Password | Role |
+|-------|----------|------|
+| admin@example.com | admin123 | ADMIN |
+| manager@example.com | manager123 | MANAGER |
+| cashier@example.com | cashier123 | ATTENDANT |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Seed accounts must change password on first login. Production seed requires `ALLOW_SEED=1`.
 
-## Deploy on Vercel
+## Features
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- POS: cash, M-Pesa (Daraja or mock), split pay, credit, VAT, price levels, promotions
+- Inventory with buying price, markup helper, opened/quarantine + return SKUs, serials
+- Purchasing + purchase orders, receivables, refunds with return conditions
+- Reports, GL journals, CSV export, 80mm thermal receipts
+- Settings, users, audit logs, forced password change
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+M-Pesa: leave Daraja env vars empty for mock STK.  
+Docs: [`docs/demo-vercel.md`](docs/demo-vercel.md) · [`docs/kenya-hardware-pos-mvp.md`](docs/kenya-hardware-pos-mvp.md) · [`docs/production.md`](docs/production.md) · [`docs/commercial-pilot.md`](docs/commercial-pilot.md)
