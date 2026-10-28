@@ -80,3 +80,19 @@ Default logins (must change password on first login):
 ## Redeploy / migrate
 
 Every Vercel production build runs `prisma migrate deploy` against Neon. New migrations in `prisma/migrations/` apply automatically on the next deploy.
+
+### Fix `P1002` advisory lock timeout
+
+Usually means **another deploy is migrating at the same time**, or Neon was asleep.
+
+1. In Vercel → **Deployments**, cancel queued/building ones — keep a single redeploy.
+2. Wait ~30s, redeploy **once**.
+3. The build script wakes Neon and retries migrate up to 6 times.
+
+You can also migrate from your laptop (then builds are faster if schema is already current):
+
+```bash
+export DATABASE_URL='postgresql://…direct-host…/kenya_hardware_pos?sslmode=require'
+export DIRECT_URL="$DATABASE_URL"
+npx prisma migrate deploy
+```
