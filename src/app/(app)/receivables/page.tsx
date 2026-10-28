@@ -135,33 +135,34 @@ export default function ReceivablesPage() {
   }
 
   function exportCsv() {
-    const rows = filtered.flatMap((c) =>
-      c.charges.length
-        ? c.charges.map((ch) => ({
+    const rows = filtered.flatMap((c) => {
+      if (!c.charges.length) {
+        return [
+          {
             customer: c.name,
             phone: c.phone || "",
             balance: c.balance,
             credit_limit: c.creditLimit,
-            receipt: ch.receiptNo,
-            sale_date: ch.completedAt,
-            age_days: ch.ageDays,
-            open_amount: ch.openAmount,
-            bucket: ch.bucket,
-          }))
-        : [
-            {
-              customer: c.name,
-              phone: c.phone || "",
-              balance: c.balance,
-              credit_limit: c.creditLimit,
-              receipt: "",
-              sale_date: "",
-              age_days: "",
-              open_amount: c.balance,
-              bucket: "",
-            },
-          ]
-    );
+            receipt: null as number | null,
+            sale_date: "",
+            age_days: null as number | null,
+            open_amount: c.balance,
+            bucket: "",
+          },
+        ];
+      }
+      return c.charges.map((ch) => ({
+        customer: c.name,
+        phone: c.phone || "",
+        balance: c.balance,
+        credit_limit: c.creditLimit,
+        receipt: ch.receiptNo as number | null,
+        sale_date: ch.completedAt,
+        age_days: ch.ageDays as number | null,
+        open_amount: ch.openAmount,
+        bucket: ch.bucket,
+      }));
+    });
     const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
