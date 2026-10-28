@@ -1,4 +1,4 @@
-import { prisma } from "./prisma";
+import { prisma, withTransaction } from "./prisma";
 import { PaymentStatus, SaleStatus } from "@prisma/client";
 import { postSaleJournal } from "./gl";
 import { sellSerials, parseSerials } from "./serials";
@@ -6,7 +6,7 @@ import { adjustQty, getOrCreateStock } from "./branch-stock";
 import { roundMoney } from "./money";
 
 export async function completePendingSale(saleId: string) {
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const sale = await tx.sale.findUnique({
       where: { id: saleId },
       include: { lines: true, payments: true, customer: true },

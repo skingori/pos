@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { prisma, withTransaction } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
 import { canChangePrice, canSellCredit } from "@/lib/permissions";
 import { roundMoney } from "@/lib/money";
@@ -305,7 +305,7 @@ export async function POST(req: NextRequest) {
   const creditBalanceBefore =
     creditAmtPlanned > 0 && customer ? roundMoney(customer.balance) : null;
 
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await withTransaction(async (tx) => {
     const sale = await tx.sale.create({
       data: {
         status: needsStk ? SaleStatus.PENDING : SaleStatus.COMPLETED,

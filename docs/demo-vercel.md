@@ -6,11 +6,17 @@ Quick public demo. Not a shop-floor production setup (see [production.md](./prod
 
 1. Sign up at [Neon](https://neon.tech) (or Prisma Postgres).
 2. Create a project / database.
-3. Copy connection strings from Neon:
-   - **Pooled** → `DATABASE_URL` (host often contains `-pooler`)
-   - **Direct** (optional) → `DIRECT_URL` (no pooler; best for migrations)
+3. Copy the **direct** connection string from Neon (host **without** `-pooler`):
 
-If you only set `DATABASE_URL`, the Vercel build falls back to it for `DIRECT_URL` automatically.
+```text
+postgresql://USER:PASSWORD@ep-xxxx.region.aws.neon.tech/DB?sslmode=require
+```
+
+Set that as **`DATABASE_URL`** on Vercel. This app uses Prisma interactive transactions (sales, stock); Neon’s **pooler** URL causes `P2028 Transaction not found`.
+
+Optional: set the same value as `DIRECT_URL`, or leave `DIRECT_URL` empty (build falls back to `DATABASE_URL`).
+
+Do **not** use a host like `ep-….‑pooler.…neon.tech` for this demo.
 
 ## 2. Push the repo to GitHub
 
