@@ -6,11 +6,11 @@ Quick public demo. Not a shop-floor production setup (see [production.md](./prod
 
 1. Sign up at [Neon](https://neon.tech) (or Prisma Postgres).
 2. Create a project / database.
-3. Copy **both** connection strings:
-   - **Pooled** → `DATABASE_URL` (often has `-pooler` in the host, or `?pgbouncer=true`)
-   - **Direct** → `DIRECT_URL` (no pooler; used by `prisma migrate`)
+3. Copy connection strings from Neon:
+   - **Pooled** → `DATABASE_URL` (host often contains `-pooler`)
+   - **Direct** (optional) → `DIRECT_URL` (no pooler; best for migrations)
 
-If you only have one URL, set both env vars to the same value for the demo.
+If you only set `DATABASE_URL`, the Vercel build falls back to it for `DIRECT_URL` automatically.
 
 ## 2. Push the repo to GitHub
 
@@ -24,8 +24,8 @@ Vercel deploys from Git. Commit and push this project, then import it in Vercel.
 
 | Name | Value |
 |------|--------|
-| `DATABASE_URL` | Neon **pooled** URL |
-| `DIRECT_URL` | Neon **direct** URL |
+| `DATABASE_URL` | Neon connection URL (required) |
+| `DIRECT_URL` | Neon **direct** URL (optional; falls back to `DATABASE_URL`) |
 | `NEXTAUTH_URL` | `https://YOUR_PROJECT.vercel.app` (update after first deploy if needed) |
 | `NEXTAUTH_SECRET` | `openssl rand -base64 32` |
 | `SHOP_NAME` | Your demo shop name |
