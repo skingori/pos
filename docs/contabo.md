@@ -189,6 +189,7 @@ Migrations run automatically on container start (`prisma migrate deploy` in the 
 
 | Symptom | Fix |
 |---|---|
+| `CustomerPayment.saleId` / column does not exist | Pull latest migrations, then `docker compose -f docker-compose.prod.yml exec app npx prisma migrate deploy` (or recreate with `down -v` if empty DB) |
 | Docker build: Prisma schema not found during `npm ci` | Pull latest Dockerfile (`npm ci --ignore-scripts`); rebuild |
 | Can't open site | Contabo firewall / UFW: allow 3000 or 80/443 |
 | Login loops / CSRF | `NEXTAUTH_URL` must match the URL in the browser exactly (`http` vs `https`, IP vs domain, port). Secure cookies are off when `NEXTAUTH_URL` is `http://` |
