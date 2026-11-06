@@ -32,13 +32,16 @@ declare module "next-auth/jwt" {
 }
 
 const isProd = process.env.NODE_ENV === "production";
+// Secure cookies only work over HTTPS. Contabo IP deploys use http://IP:3000.
+const useSecureCookies =
+  (process.env.NEXTAUTH_URL || "").trim().toLowerCase().startsWith("https://");
 
 export const authOptions: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
   session: { strategy: "jwt", maxAge: 60 * 60 * 12 },
   pages: { signIn: "/login" },
-  useSecureCookies: isProd,
-  cookies: isProd
+  useSecureCookies,
+  cookies: useSecureCookies
     ? {
         sessionToken: {
           name: `__Secure-next-auth.session-token`,

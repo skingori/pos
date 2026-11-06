@@ -191,7 +191,8 @@ Migrations run automatically on container start (`prisma migrate deploy` in the 
 |---|---|
 | Docker build: Prisma schema not found during `npm ci` | Pull latest Dockerfile (`npm ci --ignore-scripts`); rebuild |
 | Can't open site | Contabo firewall / UFW: allow 3000 or 80/443 |
-| Login loops / CSRF | `NEXTAUTH_URL` must match the URL in the browser exactly (`http` vs `https`, IP vs domain, port) |
+| Login loops / CSRF | `NEXTAUTH_URL` must match the URL in the browser exactly (`http` vs `https`, IP vs domain, port). Secure cookies are off when `NEXTAUTH_URL` is `http://` |
+| Login click does nothing / stays on login | Rebuild after auth cookie fix; ensure seed ran; `NEXTAUTH_SECRET` must not be the example value |
 | App can't reach DB | Password mismatch between `.env` and `POSTGRES_PASSWORD`; check `docker compose ... logs db` |
 | Out of memory on build | Use a 4GB VPS, or build on your laptop and push an image |
 | Seed fails | `ALLOW_SEED=1` must be set for that command only |
