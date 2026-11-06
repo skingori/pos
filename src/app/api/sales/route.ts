@@ -37,13 +37,13 @@ export async function GET(req: NextRequest) {
   const takeCap = from || to ? 500 : 2000;
   const take = Math.min(Math.max(Number(sp.get("take") || 200) || 200, 1), takeCap);
 
-  const SALE_STATUSES = [
-    "PENDING",
-    "COMPLETED",
-    "CANCELLED",
-    "REFUNDED",
-    "PARTIALLY_REFUNDED",
-  ] as const;
+  const SALE_STATUSES: SaleStatus[] = [
+    SaleStatus.PENDING,
+    SaleStatus.COMPLETED,
+    SaleStatus.CANCELLED,
+    SaleStatus.REFUNDED,
+    SaleStatus.PARTIALLY_REFUNDED,
+  ];
 
   const dateFilter =
     from || to
@@ -89,20 +89,19 @@ export async function GET(req: NextRequest) {
         ? { payments: { none: { method: "CREDIT" as PaymentMethod } } }
         : {};
 
-  const statusFilter =
-    SALE_STATUSES.includes(statusParam as (typeof SALE_STATUSES)[number])
-      ? { status: statusParam as (typeof SALE_STATUSES)[number] }
-      : {
-          // Include CANCELLED so voided credit receipts stay on the ledger.
-          status: {
-            in: [
-              "COMPLETED",
-              "REFUNDED",
-              "PARTIALLY_REFUNDED",
-              "CANCELLED",
-            ] as const,
-          },
-        };
+  const statusFilter = SALE_STATUSES.includes(statusParam as SaleStatus)
+    ? { status: statusParam as SaleStatus }
+    : {
+        // Include CANCELLED so voided credit receipts stay on the ledger.
+        status: {
+          in: [
+            SaleStatus.COMPLETED,
+            SaleStatus.REFUNDED,
+            SaleStatus.PARTIALLY_REFUNDED,
+            SaleStatus.CANCELLED,
+          ],
+        },
+      };
 
   const searchFilter = q
     ? {
