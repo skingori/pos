@@ -189,6 +189,7 @@ Migrations run automatically on container start (`prisma migrate deploy` in the 
 
 | Symptom | Fix |
 |---|---|
+| Docker build: Prisma schema not found during `npm ci` | Pull latest Dockerfile (`npm ci --ignore-scripts`); rebuild |
 | Can't open site | Contabo firewall / UFW: allow 3000 or 80/443 |
 | Login loops / CSRF | `NEXTAUTH_URL` must match the URL in the browser exactly (`http` vs `https`, IP vs domain, port) |
 | App can't reach DB | Password mismatch between `.env` and `POSTGRES_PASSWORD`; check `docker compose ... logs db` |
