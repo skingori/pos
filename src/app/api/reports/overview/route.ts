@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { SaleStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized } from "@/lib/api-auth";
@@ -27,24 +27,29 @@ const SALE_OK = {
   in: [SaleStatus.COMPLETED, SaleStatus.PARTIALLY_REFUNDED],
 };
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
 
   const branchId = await resolveBranchId(user);
+  const daysRaw = Number(req.nextUrl.searchParams.get("days") || 7);
+  const days = daysRaw === 30 || daysRaw === 90 ? daysRaw : 7;
+
   const todayStart = startOfDay();
   const yesterdayStart = addDays(todayStart, -1);
-  const weekStart = addDays(todayStart, -6);
+  const rangeStart = addDays(todayStart, -(days - 1));
 
   const [
     salesTodayRows,
     salesYesterdayRows,
-    weekSales,
+    rangeSales,
     products,
     newCustomersToday,
     newCustomersYesterday,
     recentSales,
-    weekLines,
+    rangeLines,
+    pendingRefunds,
+    debtors,
   ] = await Promise.all([
     prisma.sale.findMany({
       where: {
@@ -65,7 +70,7 @@ export async function GET() {
     prisma.sale.findMany({
       where: {
         status: SALE_OK,
-        completedAt: { gte: weekStart },
+        completedAt: { gte: rangeStart },
         branchId,
       },
       select: { total: true, completedAt: true },
@@ -99,7 +104,7 @@ export async function GET() {
       where: {
         sale: {
           status: SALE_OK,
-          completedAt: { gte: weekStart },
+          completedAt: { gte: rangeStart },
           branchId,
         },
       },
@@ -116,6 +121,8 @@ export async function GET() {
         },
       },
     }),
+    prisma.refundRequest.count({ where: { status: "PENDING" } }),
+    prisma.customer.count({ where: { active: true, balance: { gt: 0 } } }),
   ]);
 
   const salesToday = roundMoney(salesTodayRows.reduce((s, x) => s + x.total, 0));
@@ -149,30 +156,36 @@ export async function GET() {
   const outOfStock = lowStock.filter((p) => p.qty <= 0).length;
 
   const dayKeys: string[] = [];
-  for (let i = 0; i < 7; i++) {
-    dayKeys.push(addDays(weekStart, i).toISOString().slice(0, 10));
+  for (let i = 0; i < days; i++) {
+    dayKeys.push(addDays(rangeStart, i).toISOString().slice(0, 10));
   }
   const byDay = Object.fromEntries(dayKeys.map((k) => [k, 0]));
-  for (const s of weekSales) {
+  for (const s of rangeSales) {
     if (!s.completedAt) continue;
     const k = s.completedAt.toISOString().slice(0, 10);
     if (k in byDay) byDay[k] = roundMoney(byDay[k] + s.total);
   }
+  const todayKey = todayStart.toISOString().slice(0, 10);
   const salesTrend = dayKeys.map((k, i) => {
-    const d = addDays(weekStart, i);
-    const isToday = k === todayStart.toISOString().slice(0, 10);
+    const d = addDays(rangeStart, i);
+    const isToday = k === todayKey;
     const label = isToday
       ? "Today"
-      : d.toLocaleDateString("en-KE", { weekday: "short" });
+      : days <= 7
+        ? d.toLocaleDateString("en-KE", { weekday: "short" })
+        : d.toLocaleDateString("en-KE", { day: "numeric", month: "short" });
     return { date: k, label, sales: byDay[k] };
   });
+
+  const rangeTotal = roundMoney(salesTrend.reduce((s, d) => s + d.sales, 0));
+  const dailyAverage = roundMoney(rangeTotal / Math.max(days, 1));
 
   const catMap = new Map<string, { name: string; revenue: number }>();
   const productMap = new Map<
     string,
     { name: string; sold: number; imageUrl: string | null; category: string }
   >();
-  for (const line of weekLines) {
+  for (const line of rangeLines) {
     const catName = line.product.category?.name || "Uncategorized";
     const cat = catMap.get(catName) || { name: catName, revenue: 0 };
     cat.revenue = roundMoney(cat.revenue + line.lineTotal);
@@ -205,7 +218,7 @@ export async function GET() {
   const topProducts = [...productMap.entries()]
     .map(([id, p]) => ({ id, ...p }))
     .sort((a, b) => b.sold - a.sold)
-    .slice(0, 6);
+    .slice(0, 5);
 
   const recentOrders = recentSales.map((s) => {
     const firstCat =
@@ -223,6 +236,7 @@ export async function GET() {
   });
 
   return NextResponse.json({
+    days,
     salesToday,
     salesTodayChange: pctChange(salesToday, salesYesterday),
     profitToday,
@@ -234,12 +248,16 @@ export async function GET() {
     stockValue,
     lowStock,
     outOfStock,
+    lowStockCount: lowStock.length,
+    pendingRefunds,
+    openReceivables: debtors,
     salesTrend,
+    rangeTotal,
+    dailyAverage,
     salesByCategory,
     topProducts,
     recentOrders,
     branchId,
-    // backwards compatible
     fastMoving: topProducts.map((p) => ({
       productId: p.id,
       name: p.name,

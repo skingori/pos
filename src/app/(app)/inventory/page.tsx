@@ -338,8 +338,8 @@ export default function InventoryPage() {
       setError("Cost price is required");
       return;
     }
-    if (!Number.isFinite(Number(form.sellPrice)) || Number(form.sellPrice) <= 0) {
-      setError("Sell price must be greater than 0");
+    if (form.sellPrice === "" || !Number.isFinite(Number(form.sellPrice)) || Number(form.sellPrice) < 0) {
+      setError("Sell price cannot be negative");
       return;
     }
 
@@ -1224,10 +1224,10 @@ export default function InventoryPage() {
                     className="sf-input mt-1"
                     value={form.sellPrice}
                     onChange={(e) => setForm({ ...form, sellPrice: e.target.value })}
-                    required
                     type="number"
                     min={0}
                     step="0.01"
+                    placeholder="0"
                   />
                 </label>
                 <label className="block text-sm font-medium">

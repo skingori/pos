@@ -125,6 +125,9 @@ export async function PATCH(
   if (body.cost != null && Number(body.cost) < 0) {
     return NextResponse.json({ error: "Buying price required" }, { status: 400 });
   }
+  if (body.sellPrice != null && (!Number.isFinite(Number(body.sellPrice)) || Number(body.sellPrice) < 0)) {
+    return NextResponse.json({ error: "Sell price cannot be negative" }, { status: 400 });
+  }
 
   const nextImageUrl =
     body.imageUrl === undefined ? existing.imageUrl : body.imageUrl || null;

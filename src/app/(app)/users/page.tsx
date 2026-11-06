@@ -100,6 +100,16 @@ function IconPlus({ className = "h-4 w-4" }: { className?: string }) {
   );
 }
 
+function IconUserPlus({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M19 8v6M22 11h-6" />
+    </svg>
+  );
+}
+
 function IconEdit({ className = "h-4 w-4" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -276,12 +286,12 @@ export default function UsersPage() {
             User Directory
           </h1>
 
-          <label className="relative min-w-[12rem] flex-1 sm:max-w-xs">
-            <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400">
-              <IconSearch />
+          <label className="sf-search min-w-[12rem] flex-1 sm:max-w-xs">
+            <span className="sf-search-icon" aria-hidden>
+              <IconSearch className="h-3.5 w-3.5" />
             </span>
             <input
-              className="sf-input w-full pl-9"
+              type="search"
               placeholder="Search users"
               value={q}
               onChange={(e) => {
@@ -309,7 +319,7 @@ export default function UsersPage() {
           </select>
 
           <button type="button" className="sf-btn sf-btn-primary gap-1.5" onClick={openCreate}>
-            <IconPlus className="h-3.5 w-3.5" />
+            <IconUserPlus className="h-3.5 w-3.5" />
             New user
           </button>
         </div>

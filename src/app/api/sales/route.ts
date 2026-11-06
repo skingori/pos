@@ -9,7 +9,7 @@ import { completePendingSale } from "@/lib/sales";
 import { getShopSettings } from "@/lib/settings";
 import { computeTax } from "@/lib/tax";
 import { postSaleJournal } from "@/lib/gl";
-import { parseSerials, sellSerials } from "@/lib/serials";
+import { assertSellableSerials, parseSerials, sellSerials } from "@/lib/serials";
 import { PaymentMethod, PaymentStatus, SaleStatus } from "@prisma/client";
 import { resolveBranchId } from "@/lib/branch";
 import { adjustQty, getOrCreateStock } from "@/lib/branch-stock";
@@ -30,10 +30,20 @@ export async function GET(req: NextRequest) {
   const from = sp.get("from");
   const to = sp.get("to");
   const method = sp.get("method")?.toUpperCase();
-  const credit = sp.get("credit"); // all | credit | paid
+  const credit = sp.get("credit"); // all | credit | paid (legacy settlement filter)
+  const statusParam = (sp.get("status") || "").toUpperCase();
   const minAmount = sp.get("minAmount");
   const maxAmount = sp.get("maxAmount");
-  const take = Math.min(Math.max(Number(sp.get("take") || 200) || 200, 1), 500);
+  const takeCap = from || to ? 500 : 2000;
+  const take = Math.min(Math.max(Number(sp.get("take") || 200) || 200, 1), takeCap);
+
+  const SALE_STATUSES = [
+    "PENDING",
+    "COMPLETED",
+    "CANCELLED",
+    "REFUNDED",
+    "PARTIALLY_REFUNDED",
+  ] as const;
 
   const dateFilter =
     from || to
@@ -62,14 +72,37 @@ export async function GET(req: NextRequest) {
   const methodFilter =
     method && ["CASH", "MPESA", "CREDIT"].includes(method)
       ? { payments: { some: { method: method as PaymentMethod } } }
-      : {};
+      : method === "SPLIT"
+        ? {
+            // At least two payment rows; refined below to distinct methods.
+            payments: { some: {} },
+          }
+        : {};
 
+  const settlement = statusParam === "PAID" || statusParam === "CREDIT"
+    ? statusParam.toLowerCase()
+    : credit;
   const creditFilter =
-    credit === "credit"
+    settlement === "credit"
       ? { payments: { some: { method: "CREDIT" as PaymentMethod } } }
-      : credit === "paid"
+      : settlement === "paid"
         ? { payments: { none: { method: "CREDIT" as PaymentMethod } } }
         : {};
+
+  const statusFilter =
+    SALE_STATUSES.includes(statusParam as (typeof SALE_STATUSES)[number])
+      ? { status: statusParam as (typeof SALE_STATUSES)[number] }
+      : {
+          // Include CANCELLED so voided credit receipts stay on the ledger.
+          status: {
+            in: [
+              "COMPLETED",
+              "REFUNDED",
+              "PARTIALLY_REFUNDED",
+              "CANCELLED",
+            ] as const,
+          },
+        };
 
   const searchFilter = q
     ? {
@@ -83,9 +116,9 @@ export async function GET(req: NextRequest) {
       }
     : {};
 
-  const sales = await prisma.sale.findMany({
+  let sales = await prisma.sale.findMany({
     where: {
-      status: { in: ["COMPLETED", "REFUNDED", "PARTIALLY_REFUNDED"] },
+      ...statusFilter,
       ...dateFilter,
       ...amountFilter,
       ...methodFilter,
@@ -99,8 +132,15 @@ export async function GET(req: NextRequest) {
       payments: true,
     },
     orderBy: { completedAt: "desc" },
-    take,
+    take: method === "SPLIT" ? Math.min(take * 3, takeCap) : take,
   });
+
+  if (method === "SPLIT") {
+    sales = sales
+      .filter((s) => new Set(s.payments.map((p) => p.method)).size > 1)
+      .slice(0, take);
+  }
+
   return NextResponse.json(sales);
 }
 
@@ -196,7 +236,15 @@ export async function POST(req: NextRequest) {
     if (product.trackSerial) {
       if (serials.length !== Math.round(line.qty)) {
         return NextResponse.json(
-          { error: `${product.name} needs ${line.qty} serial number(s)` },
+          { error: `${product.name} needs ${Math.round(line.qty)} serial number(s)` },
+          { status: 400 }
+        );
+      }
+      try {
+        await assertSellableSerials(prisma, product.id, serials, branchId);
+      } catch (e) {
+        return NextResponse.json(
+          { error: e instanceof Error ? e.message : "Invalid serial" },
           { status: 400 }
         );
       }
@@ -295,7 +343,8 @@ export async function POST(req: NextRequest) {
   }
 
   const mpesaPay = normalizedPayments.find((p) => p.method === "MPESA");
-  const needsStk = Boolean(mpesaPay && mpesaPay.amount > 0);
+  // STK only when a phone is provided; blank phone = till/paybill confirmed at counter.
+  const needsStk = Boolean(mpesaPay && mpesaPay.amount > 0 && mpesaPay.phone?.trim());
 
   const creditAmtPlanned = roundMoney(
     normalizedPayments
@@ -305,80 +354,90 @@ export async function POST(req: NextRequest) {
   const creditBalanceBefore =
     creditAmtPlanned > 0 && customer ? roundMoney(customer.balance) : null;
 
-  const result = await withTransaction(async (tx) => {
-    const sale = await tx.sale.create({
-      data: {
-        status: needsStk ? SaleStatus.PENDING : SaleStatus.COMPLETED,
-        customerId: customerId || null,
-        cashierId: user.id,
-        branchId,
-        sessionId: session.id,
-        subtotal,
-        discount,
-        taxRate: settings.vatPercent,
-        taxAmount,
-        total,
-        costTotal,
-        creditDueAt:
-          hasCredit && creditDueAt && !Number.isNaN(creditDueAt.getTime())
-            ? creditDueAt
-            : null,
-        creditBalanceBefore,
-        completedAt: needsStk ? null : new Date(),
-        lines: { create: saleLines },
-        payments: {
-          create: normalizedPayments.map((p) => ({
-            method: p.method,
-            amount: Number(p.amount),
-            status:
-              p.method === "MPESA" ? PaymentStatus.PENDING : PaymentStatus.PAID,
-            mpesaPhone: p.phone || null,
-          })),
+  let result;
+  try {
+    result = await withTransaction(async (tx) => {
+      const sale = await tx.sale.create({
+        data: {
+          status: needsStk ? SaleStatus.PENDING : SaleStatus.COMPLETED,
+          customerId: customerId || null,
+          cashierId: user.id,
+          branchId,
+          sessionId: session.id,
+          subtotal,
+          discount,
+          taxRate: settings.vatPercent,
+          taxAmount,
+          total,
+          costTotal,
+          creditDueAt:
+            hasCredit && creditDueAt && !Number.isNaN(creditDueAt.getTime())
+              ? creditDueAt
+              : null,
+          creditBalanceBefore,
+          completedAt: needsStk ? null : new Date(),
+          lines: { create: saleLines },
+          payments: {
+            create: normalizedPayments.map((p) => ({
+              method: p.method,
+              amount: Number(p.amount),
+              status:
+                p.method === "MPESA" && p.phone?.trim()
+                  ? PaymentStatus.PENDING
+                  : PaymentStatus.PAID,
+              mpesaPhone: p.phone || null,
+            })),
+          },
         },
-      },
-      include: { payments: true, lines: true, customer: true },
-    });
+        include: { payments: true, lines: true, customer: true },
+      });
 
-    if (!needsStk) {
-      for (const line of saleLines) {
-        await getOrCreateStock(tx, branchId, line.productId);
-        await adjustQty(tx, branchId, line.productId, -line.qty);
-        await sellSerials(tx, line.productId, line.serials || [], sale.id, branchId);
-      }
-      if (creditAmtPlanned > 0 && customerId) {
-        await tx.customer.update({
-          where: { id: customerId },
-          data: { balance: { increment: creditAmtPlanned } },
+      if (!needsStk) {
+        for (const line of saleLines) {
+          await getOrCreateStock(tx, branchId, line.productId);
+          await adjustQty(tx, branchId, line.productId, -line.qty);
+          await sellSerials(tx, line.productId, line.serials || [], sale.id, branchId);
+        }
+        if (creditAmtPlanned > 0 && customerId) {
+          await tx.customer.update({
+            where: { id: customerId },
+            data: { balance: { increment: creditAmtPlanned } },
+          });
+        }
+        await postSaleJournal(tx, {
+          id: sale.id,
+          receiptNo: sale.receiptNo,
+          total: sale.total,
+          taxAmount: sale.taxAmount,
+          costTotal: sale.costTotal,
+          payments: sale.payments.map((p) => ({
+            method: p.method,
+            amount: p.amount,
+            status: p.status,
+          })),
         });
       }
-      await postSaleJournal(tx, {
-        id: sale.id,
-        receiptNo: sale.receiptNo,
-        total: sale.total,
-        taxAmount: sale.taxAmount,
-        costTotal: sale.costTotal,
-        payments: sale.payments.map((p) => ({
-          method: p.method,
-          amount: p.amount,
-          status: p.status,
-        })),
-      });
-    }
 
-    return sale;
-  });
+      return sale;
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Sale failed";
+    const business = /serial|duplicate|missing gl|insufficient|credit/i.test(message);
+    console.error("Sale POST failed:", e);
+    return NextResponse.json(
+      { error: message },
+      { status: business ? 400 : 500 }
+    );
+  }
 
   if (needsStk && mpesaPay) {
     const payment = result.payments.find((p) => p.method === "MPESA");
     if (!payment) {
       return NextResponse.json({ error: "M-Pesa payment missing" }, { status: 500 });
     }
-    if (!mpesaPay.phone) {
-      return NextResponse.json({ error: "M-Pesa phone required" }, { status: 400 });
-    }
     try {
       const stk = await initiateStkPush({
-        phone: mpesaPay.phone,
+        phone: mpesaPay.phone!,
         amount: mpesaPay.amount,
         accountRef: `R${result.receiptNo}`,
         paymentId: payment.id,

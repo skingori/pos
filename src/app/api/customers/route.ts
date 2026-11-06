@@ -4,24 +4,83 @@ import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
 import { canManageInventory } from "@/lib/permissions";
 import { zodErrorResponse } from "@/lib/api";
+import { getCustomerOpenCharges } from "@/lib/customer-account";
+import { roundMoney } from "@/lib/money";
 
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+
   const q = req.nextUrl.searchParams.get("q")?.trim();
+  const owingOnly = req.nextUrl.searchParams.get("owing") === "1";
+  const includeInactive = req.nextUrl.searchParams.get("inactive") === "1";
+  const sort = req.nextUrl.searchParams.get("sort") || "outstanding";
+
   const customers = await prisma.customer.findMany({
     where: {
-      active: true,
+      ...(includeInactive ? {} : { active: true }),
+      ...(owingOnly ? { balance: { gt: 0 } } : {}),
       ...(q
         ? {
             OR: [{ name: { contains: q } }, { phone: { contains: q } }],
           }
         : {}),
     },
-    include: { priceLevel: true },
-    orderBy: { name: "asc" },
+    include: {
+      priceLevel: true,
+      payments: {
+        where: { isWriteOff: false },
+        orderBy: { createdAt: "desc" },
+        take: 1,
+      },
+    },
   });
-  return NextResponse.json(customers);
+
+  const now = new Date();
+  const enriched = await Promise.all(
+    customers.map(async (c) => {
+      const charges = c.balance > 0.009 ? await getCustomerOpenCharges(c.id) : [];
+      const overdue = charges.filter((ch) => ch.dueAt && new Date(ch.dueAt) < now);
+      const oldestOverdue =
+        overdue.length > 0
+          ? [...overdue].sort(
+              (a, b) => new Date(a.dueAt!).getTime() - new Date(b.dueAt!).getTime()
+            )[0].dueAt
+          : null;
+      const last = c.payments[0] || null;
+      return {
+        id: c.id,
+        name: c.name,
+        phone: c.phone,
+        email: c.email,
+        creditLimit: c.creditLimit,
+        balance: roundMoney(c.balance),
+        active: c.active,
+        createdAt: c.createdAt.toISOString(),
+        priceLevel: c.priceLevel,
+        priceLevelId: c.priceLevelId,
+        openReceipts: charges.length,
+        oldestOverdue,
+        lastPayment: last
+          ? { at: last.createdAt.toISOString(), amount: last.amount }
+          : null,
+      };
+    })
+  );
+
+  enriched.sort((a, b) => {
+    if (sort === "name") return a.name.localeCompare(b.name);
+    if (sort === "last_payment") {
+      const at = a.lastPayment?.at || "";
+      const bt = b.lastPayment?.at || "";
+      return bt.localeCompare(at);
+    }
+    // outstanding (default): largest first, then name
+    if (b.balance !== a.balance) return b.balance - a.balance;
+    return a.name.localeCompare(b.name);
+  });
+
+  return NextResponse.json(enriched);
 }
 
 export async function POST(req: NextRequest) {

@@ -92,12 +92,13 @@ model Branch {
   active    Boolean       @default(true)
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
-  users     User[]
-  sessions  PosSession[]
-  sales     Sale[]
-  purchases Purchase[]
-  stocks    BranchStock[]
-  serials   SerialUnit[]
+  users      User[]
+  sessions   PosSession[]
+  sales      Sale[]
+  purchases  Purchase[]
+  stocks     BranchStock[]
+  serials    SerialUnit[]
+  heldSales  HeldSale[]
 }
 
 model BranchStock {
@@ -153,6 +154,8 @@ model User {
   refundsRev         RefundRequest[] @relation("RefundReviewer")
   auditLogs          AuditLog[]
   purchases          Purchase[]
+  customerPayments   CustomerPayment[]
+  heldSales          HeldSale[]
 }
 
 model Category {
@@ -265,6 +268,7 @@ model Customer {
   createdAt    DateTime          @default(now())
   sales        Sale[]
   payments     CustomerPayment[]
+  heldSales    HeldSale[]
 }
 
 model Supplier {
@@ -302,6 +306,27 @@ model PurchaseLine {
   product    Product  @relation(fields: [productId], references: [id])
   qty        Float
   unitCost   Float
+}
+
+model HeldSale {
+  id           String    @id @default(cuid())
+  branchId     String
+  branch       Branch    @relation(fields: [branchId], references: [id])
+  cashierId    String
+  cashier      User      @relation(fields: [cashierId], references: [id])
+  customerId   String?
+  customer     Customer? @relation(fields: [customerId], references: [id])
+  label        String
+  cart         Json
+  discount     Float     @default(0)
+  discountMode String    @default("none")
+  promoCode    String    @default("")
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([branchId, expiresAt])
+  @@index([cashierId])
 }
 
 model PosSession {
@@ -365,9 +390,10 @@ model Sale {
   creditBalanceBefore Float?
   createdAt           DateTime        @default(now())
   completedAt         DateTime?
-  lines       SaleLine[]
-  payments    Payment[]
-  refunds     RefundRequest[]
+  lines             SaleLine[]
+  payments          Payment[]
+  refunds           RefundRequest[]
+  customerPayments  CustomerPayment[]
 
   @@index([branchId])
 }
@@ -439,10 +465,18 @@ model CustomerPayment {
   receiptNo  Int           @unique @default(autoincrement())
   customerId String
   customer   Customer      @relation(fields: [customerId], references: [id])
+  /// When set, this payment applies to that credit sale first (per-receipt Pay).
+  saleId     String?
+  sale       Sale?         @relation(fields: [saleId], references: [id])
   amount     Float
   method     PaymentMethod @default(CASH)
   note       String?
+  isWriteOff Boolean       @default(false)
+  userId     String?
+  user       User?         @relation(fields: [userId], references: [id])
   createdAt  DateTime      @default(now())
+
+  @@index([saleId])
 }
 
 model AuditLog {

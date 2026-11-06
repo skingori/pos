@@ -5,7 +5,7 @@ export function canChangePrice(role: Role) {
 }
 
 export function canSellCredit(role: Role) {
-  return role === Role.ADMIN || role === Role.MANAGER;
+  return role === Role.ADMIN || role === Role.MANAGER || role === Role.ATTENDANT;
 }
 
 export function canApproveRefund(role: Role) {

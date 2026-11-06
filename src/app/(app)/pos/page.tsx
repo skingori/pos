@@ -1,15 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { formatKes, roundMoney } from "@/lib/money";
+import { clampUnitPrice, formatKes, roundMoney } from "@/lib/money";
 import { computeTax } from "@/lib/tax";
 import { useSession } from "next-auth/react";
 import { canChangePrice, canSellCredit } from "@/lib/permissions";
 import { Role } from "@prisma/client";
 import Link from "next/link";
-import { QtyStepper, allowsDecimal, decimalStep } from "@/components/ui/qty-stepper";
+import {
+  QtyStepper,
+  CartPriceInput,
+  allowsDecimal,
+  decimalStep,
+} from "@/components/ui/qty-stepper";
 import { ThermalReceipt, type ThermalReceiptData } from "@/components/thermal-receipt";
+import { CustomerPicker } from "@/components/customer-picker";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { downloadReceiptPdf, emailReceipt } from "@/lib/receipt-export";
+import { printThermalReceipt } from "@/lib/print-thermal";
 
 type PayMethod = "CASH" | "MPESA" | "CARD" | "BANK" | "CREDIT";
 
@@ -43,6 +51,8 @@ type CartItem = {
   unit: string;
   qty: number;
   unitPrice: number;
+  /** When true, unitPrice is the final sell price (skip price-level %). */
+  priceOverridden?: boolean;
   maxQty: number;
   trackSerial?: boolean;
   serials: string[];
@@ -58,6 +68,7 @@ type HeldSale = {
   promoCode: string;
   customerId: string;
   heldAt: number;
+  cashierName?: string;
 };
 type CompletedSale = {
   id: string;
@@ -88,14 +99,21 @@ type CatFilter = "frequent" | "all" | string;
 type SplitLine = { method: PayMethod; amount: string };
 
 const FREQ_KEY = "sf_pos_frequent";
-const HELD_KEY = "sf:pos:held-sales";
-const HELD_TTL_MS = 2 * 60 * 60 * 1000;
-const HELD_MAX = 10;
+const LEGACY_HELD_KEY = "sf:pos:held-sales";
 const METHODS: { id: PayMethod; label: string }[] = [
   { id: "CASH", label: "Cash" },
   { id: "MPESA", label: "M-Pesa" },
   { id: "CARD", label: "Card" },
   { id: "BANK", label: "Bank Transfer" },
+];
+
+const METHOD_OPTIONS = METHODS.map((m) => ({ value: m.id, label: m.label }));
+
+const DISCOUNT_OPTIONS = [
+  { value: "none", label: "None" },
+  { value: "5", label: "5% off" },
+  { value: "10", label: "10% off" },
+  { value: "custom", label: "Custom amount" },
 ];
 
 function loadFrequent(): Record<string, number> {
@@ -112,22 +130,21 @@ function bumpFrequent(ids: string[]) {
   localStorage.setItem(FREQ_KEY, JSON.stringify(map));
 }
 
-function loadHeldSales(): HeldSale[] {
+function readLegacyHeldSales(): HeldSale[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(HELD_KEY) || "[]");
+    const raw = JSON.parse(localStorage.getItem(LEGACY_HELD_KEY) || "[]");
     if (!Array.isArray(raw)) return [];
-    const now = Date.now();
-    return raw.filter((h: HeldSale) => h?.heldAt && now - h.heldAt < HELD_TTL_MS);
+    return raw.filter((h: HeldSale) => h?.cart?.length);
   } catch {
     return [];
   }
 }
 
-function saveHeldSales(list: HeldSale[]) {
+function clearLegacyHeldSales() {
   try {
-    localStorage.setItem(HELD_KEY, JSON.stringify(list.slice(0, HELD_MAX)));
+    localStorage.removeItem(LEGACY_HELD_KEY);
   } catch {
-    /* ignore quota */
+    /* ignore */
   }
 }
 
@@ -135,7 +152,9 @@ function heldAgeLabel(heldAt: number) {
   const mins = Math.floor((Date.now() - heldAt) / 60000);
   if (mins < 1) return "just now";
   if (mins < 60) return `${mins}m ago`;
-  return `${Math.floor(mins / 60)}h ${mins % 60}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h ${mins % 60}m ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 function ymdPlus(days: number) {
@@ -167,30 +186,6 @@ function IconPlay({ className = "h-3 w-3" }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
       <path d="M8 5v14l11-7z" />
     </svg>
-  );
-}
-
-function Switch({
-  on,
-  onToggle,
-  label,
-}: {
-  on: boolean;
-  onToggle: () => void;
-  label: string;
-}) {
-  return (
-    <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700">
-      <button
-        type="button"
-        role="switch"
-        aria-checked={on}
-        data-on={on}
-        className="sf-switch"
-        onClick={onToggle}
-      />
-      {label}
-    </label>
   );
 }
 
@@ -234,10 +229,41 @@ export default function PosPage() {
   const [settings, setSettings] = useState<ShopSettings | null>(null);
   const [heldSales, setHeldSales] = useState<HeldSale[]>([]);
   const [heldOpen, setHeldOpen] = useState(true);
+  const [dueDays, setDueDays] = useState(7);
+
+  async function refreshHeldSales() {
+    const list = await fetch("/api/held-sales")
+      .then((r) => r.json())
+      .catch(() => null);
+    if (Array.isArray(list)) setHeldSales(list as HeldSale[]);
+  }
+
+  async function migrateLegacyHeldSales() {
+    const legacy = readLegacyHeldSales();
+    if (!legacy.length) return;
+    for (const h of legacy) {
+      await fetch("/api/held-sales", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: h.label,
+          cart: h.cart,
+          discount: h.discount,
+          discountMode: h.discountMode,
+          promoCode: h.promoCode,
+          customerId: h.customerId || "",
+        }),
+      }).catch(() => null);
+    }
+    clearLegacyHeldSales();
+  }
 
   useEffect(() => {
     setFrequent(loadFrequent());
-    setHeldSales(loadHeldSales());
+    (async () => {
+      await migrateLegacyHeldSales();
+      await refreshHeldSales();
+    })();
     fetch("/api/products").then((r) => r.json()).then((p) => setProducts(Array.isArray(p) ? p : []));
     fetch("/api/categories").then((r) => r.json()).then((c) => setCategories(Array.isArray(c) ? c : []));
     fetch("/api/customers").then((r) => r.json()).then((c) => setCustomers(Array.isArray(c) ? c : []));
@@ -255,14 +281,10 @@ export default function PosPage() {
   }, []);
 
   useEffect(() => {
-    const prune = setInterval(() => {
-      setHeldSales((prev) => {
-        const next = prev.filter((h) => Date.now() - h.heldAt < HELD_TTL_MS);
-        if (next.length !== prev.length) saveHeldSales(next);
-        return next;
-      });
+    const refresh = setInterval(() => {
+      refreshHeldSales();
     }, 60_000);
-    return () => clearInterval(prune);
+    return () => clearInterval(refresh);
   }, []);
 
   const sellable = useMemo(() => products.filter((p) => !p.isReturnSku), [products]);
@@ -294,15 +316,34 @@ export default function PosPage() {
   }, [sellable, q, cat, frequent]);
 
   const selectedCustomer = customers.find((c) => c.id === customerId);
+
+  function addCustomerToList(c: Customer) {
+    setCustomers((prev) => (prev.some((x) => x.id === c.id) ? prev : [c, ...prev]));
+  }
   const levelOff = selectedCustomer?.priceLevel?.discountPercent || 0;
 
-  const subtotal = roundMoney(
-    cart.reduce((s, i) => {
-      const price =
-        levelOff > 0 ? roundMoney(i.unitPrice * (1 - levelOff / 100)) : i.unitPrice;
-      return s + i.qty * price;
-    }, 0)
-  );
+  function lineUnit(item: CartItem) {
+    const raw =
+      item.priceOverridden || levelOff <= 0
+        ? item.unitPrice
+        : roundMoney(item.unitPrice * (1 - levelOff / 100));
+    return clampUnitPrice(raw);
+  }
+
+  function setLinePrice(productId: string, raw: string) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return;
+    const price = clampUnitPrice(n);
+    setCart((prev) =>
+      prev.map((i) =>
+        i.productId === productId
+          ? { ...i, unitPrice: price, priceOverridden: true }
+          : i
+      )
+    );
+  }
+
+  const subtotal = roundMoney(cart.reduce((s, i) => s + i.qty * lineUnit(i), 0));
 
   useEffect(() => {
     if (discountMode === "none") setDiscount(0);
@@ -322,8 +363,7 @@ export default function PosPage() {
     const lines =
       sale?.lines ||
       cart.map((i) => {
-        const unit =
-          levelOff > 0 ? roundMoney(i.unitPrice * (1 - levelOff / 100)) : i.unitPrice;
+        const unit = lineUnit(i);
         return {
           name: i.name,
           qty: i.qty,
@@ -338,11 +378,24 @@ export default function PosPage() {
             ...(depositN > 0
               ? [{ method: depositMethod, amount: depositN, mpesaReceipt: null as string | null }]
               : []),
-            ...(creditBalance > 0
-              ? [{ method: "CREDIT", amount: creditBalance, mpesaReceipt: null as string | null }]
+            ...(creditOnAccount > 0
+              ? [{ method: "CREDIT", amount: creditOnAccount, mpesaReceipt: null as string | null }]
               : []),
           ]
-        : [];
+        : docType === "bill" && !onCredit && !split && appliedStoreCredit > 0
+          ? [
+              { method: "CREDIT", amount: appliedStoreCredit, mpesaReceipt: null as string | null },
+              ...(amountDueNow > 0.01
+                ? [
+                    {
+                      method: payMethod,
+                      amount: amountDueNow,
+                      mpesaReceipt: null as string | null,
+                    },
+                  ]
+                : []),
+            ]
+          : [];
     return {
       receiptNo: sale?.receiptNo || 0,
       total: sale?.total ?? total,
@@ -375,11 +428,31 @@ export default function PosPage() {
   }
 
   const depositN = Number(depositAmount) || 0;
-  const creditBalance = onCredit ? roundMoney(Math.max(0, total - depositN)) : 0;
+  const accountBalance = roundMoney(selectedCustomer?.balance || 0);
+  const storeCredit = Math.max(0, -accountBalance);
+  const creditOnAccount = onCredit ? roundMoney(Math.max(0, total - depositN)) : 0;
+  const storeCreditOnCreditSale = onCredit
+    ? roundMoney(Math.min(storeCredit, creditOnAccount))
+    : 0;
+  const netPutOnAccount = roundMoney(Math.max(0, creditOnAccount - storeCreditOnCreditSale));
+  const appliedStoreCredit =
+    !onCredit && !split && customerId && storeCredit > 0.009
+      ? roundMoney(Math.min(storeCredit, total))
+      : 0;
+  const amountDueNow = roundMoney(Math.max(0, total - appliedStoreCredit));
   const tendered = Number(cashTendered) || 0;
+  const cashPayActive =
+    !onCredit && !split && payMethod === "CASH" && amountDueNow > 0.01;
+  const cashStatus: "ok" | "missing" | "short" | null = !cashPayActive
+    ? null
+    : !cashTendered.trim() || tendered <= 0.009
+      ? "missing"
+      : tendered + 0.01 < amountDueNow
+        ? "short"
+        : "ok";
   const changeDue =
-    !onCredit && !split && payMethod === "CASH" && tendered > total
-      ? roundMoney(tendered - total)
+    cashStatus === "ok" && tendered > amountDueNow
+      ? roundMoney(tendered - amountDueNow)
       : 0;
 
   function addProduct(p: Product) {
@@ -458,49 +531,75 @@ export default function PosPage() {
     ]);
   }
 
-  function holdCurrentSale() {
+  async function holdCurrentSale() {
     if (!cart.length || loading || receipt) return;
     const label =
       (typeof window !== "undefined"
         ? window.prompt("Label this held sale (optional):")
         : null) || undefined;
-    const held: HeldSale = {
-      id: crypto.randomUUID(),
-      label: label?.trim() || `Sale (${cart.length} items)`,
-      cart,
-      discount,
-      discountMode,
-      promoCode,
-      customerId,
-      heldAt: Date.now(),
-    };
-    const next = [held, ...heldSales].slice(0, HELD_MAX);
-    setHeldSales(next);
-    saveHeldSales(next);
-    setHeldOpen(true);
-    clearCartSale();
+    setLoading(true);
     setError("");
+    try {
+      const res = await fetch("/api/held-sales", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: label?.trim() || undefined,
+          cart,
+          discount,
+          discountMode,
+          promoCode,
+          customerId,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.error || "Could not hold sale");
+        return;
+      }
+      setHeldSales((prev) => [data as HeldSale, ...prev.filter((h) => h.id !== data.id)]);
+      setHeldOpen(true);
+      clearCartSale();
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function restoreHeld(id: string) {
-    const held = heldSales.find((h) => h.id === id);
-    if (!held) return;
-    const next = heldSales.filter((h) => h.id !== id);
-    setHeldSales(next);
-    saveHeldSales(next);
-    setCart(held.cart);
-    setDiscount(held.discount);
-    setDiscountMode(held.discountMode);
-    setPromoCode(held.promoCode);
-    setPromoMsg(held.promoCode ? `Restored promo ${held.promoCode}` : "");
-    setCustomerId(held.customerId);
+  async function restoreHeld(id: string) {
+    if (loading) return;
+    if (cart.length) {
+      const ok =
+        typeof window === "undefined" ||
+        window.confirm("Replace the current cart with this held sale?");
+      if (!ok) return;
+    }
+    setLoading(true);
     setError("");
+    try {
+      const res = await fetch(`/api/held-sales/${id}`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.error || "Could not restore held sale");
+        await refreshHeldSales();
+        return;
+      }
+      const held = data as HeldSale;
+      setHeldSales((prev) => prev.filter((h) => h.id !== id));
+      setCart(held.cart || []);
+      setDiscount(held.discount || 0);
+      setDiscountMode(held.discountMode || "none");
+      setPromoCode(held.promoCode || "");
+      setPromoMsg(held.promoCode ? `Restored promo ${held.promoCode}` : "");
+      setCustomerId(held.customerId || "");
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function discardHeld(id: string) {
-    const next = heldSales.filter((h) => h.id !== id);
-    setHeldSales(next);
-    saveHeldSales(next);
+  async function discardHeld(id: string) {
+    setHeldSales((prev) => prev.filter((h) => h.id !== id));
+    const res = await fetch(`/api/held-sales/${id}`, { method: "DELETE" });
+    if (!res.ok) await refreshHeldSales();
   }
 
   useEffect(() => {
@@ -556,23 +655,26 @@ export default function PosPage() {
         setError("A credit sale needs a customer so the debt can be collected later.");
         return null;
       }
+      if (!creditDueAt || Number.isNaN(new Date(`${creditDueAt}T12:00:00`).getTime())) {
+        setError("Set a valid credit due date.");
+        return null;
+      }
       if (depositN > total + 0.01) {
         setError("Deposit cannot exceed total");
         return null;
       }
       const out: { method: PayMethod; amount: number; phone?: string }[] = [];
       if (depositN > 0) {
-        if (depositMethod === "MPESA" && !mpesaPhone.trim()) {
-          setError("Enter M-Pesa phone for the deposit");
-          return null;
-        }
         out.push({
           method: depositMethod,
           amount: depositN,
-          phone: depositMethod === "MPESA" ? mpesaPhone.trim() : undefined,
+          phone:
+            depositMethod === "MPESA" && mpesaPhone.trim()
+              ? mpesaPhone.trim()
+              : undefined,
         });
       }
-      if (creditBalance > 0.01) out.push({ method: "CREDIT", amount: creditBalance });
+      if (creditOnAccount > 0.01) out.push({ method: "CREDIT", amount: creditOnAccount });
       if (!out.length) {
         setError("Nothing to charge");
         return null;
@@ -585,15 +687,12 @@ export default function PosPage() {
         .map((s) => ({
           method: s.method,
           amount: Number(s.amount) || 0,
-          phone: s.method === "MPESA" ? mpesaPhone.trim() : undefined,
+          phone:
+            s.method === "MPESA" && mpesaPhone.trim() ? mpesaPhone.trim() : undefined,
         }))
         .filter((s) => s.amount > 0);
       if (lines.length < 2) {
         setError("Enter at least two amounts, or turn split off to take one payment.");
-        return null;
-      }
-      if (lines.some((l) => l.method === "MPESA") && !mpesaPhone.trim()) {
-        setError("Enter customer M-Pesa phone");
         return null;
       }
       const nonCash = roundMoney(
@@ -613,22 +712,35 @@ export default function PosPage() {
       return lines;
     }
 
-    if (payMethod === "MPESA" && !mpesaPhone.trim()) {
-      setError("Enter customer M-Pesa phone");
-      return null;
+    const out: { method: PayMethod; amount: number; phone?: string }[] = [];
+    if (appliedStoreCredit > 0.01) {
+      out.push({ method: "CREDIT", amount: appliedStoreCredit });
     }
-    const amount = payMethod === "CASH" ? Math.max(tendered, total) : total;
-    if (payMethod === "CASH" && tendered + 0.01 < total && tendered > 0) {
-      setError(`Cash tendered is short of ${formatKes(total)}`);
-      return null;
-    }
-    return [
-      {
+    if (amountDueNow > 0.01) {
+      if (payMethod === "CASH") {
+        if (!cashTendered.trim() || tendered <= 0.009) {
+          setError(`Enter cash tendered. Need ${formatKes(amountDueNow)}.`);
+          return null;
+        }
+        if (tendered + 0.01 < amountDueNow) {
+          setError(
+            `Cash short. Tendered ${formatKes(tendered)}, need ${formatKes(amountDueNow)}.`
+          );
+          return null;
+        }
+      }
+      out.push({
         method: payMethod,
-        amount: payMethod === "CASH" ? (tendered || total) : amount,
-        phone: payMethod === "MPESA" ? mpesaPhone.trim() : undefined,
-      },
-    ];
+        amount: payMethod === "CASH" ? tendered : amountDueNow,
+        phone:
+          payMethod === "MPESA" && mpesaPhone.trim() ? mpesaPhone.trim() : undefined,
+      });
+    }
+    if (!out.length) {
+      setError("Nothing to charge");
+      return null;
+    }
+    return out;
   }
 
   async function checkout() {
@@ -641,40 +753,65 @@ export default function PosPage() {
     if (!payments) return;
 
     setLoading(true);
-    const res = await fetch("/api/sales", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        customerId: customerId || null,
-        discount,
-        creditDueAt: onCredit ? creditDueAt : null,
-        lines: cart.map((c) => ({
-          productId: c.productId,
-          qty: c.qty,
-          unitPrice: canDiscount ? c.unitPrice : undefined,
-          serials: c.trackSerial ? c.serials : undefined,
-        })),
-        payments,
-      }),
-    });
-    const data = await res.json();
-    setLoading(false);
-    if (!res.ok) {
-      setError(data.error || "Sale failed");
-      return;
-    }
-    if (data.stkPending) {
-      setError("Waiting for M-Pesa...");
-      const confirm = await fetch(`/api/sales/${data.id}/confirm-mpesa`, { method: "POST" });
-      const confirmed = await confirm.json();
-      if (!confirm.ok) {
-        setError(confirmed.error || "M-Pesa not confirmed");
+    try {
+      const res = await fetch("/api/sales", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customerId: customerId || null,
+          discount,
+          creditDueAt: onCredit ? creditDueAt : null,
+          lines: cart.map((c) => ({
+            productId: c.productId,
+            qty: c.qty,
+            unitPrice: canDiscount ? lineUnit(c) : undefined,
+            serials: c.trackSerial ? c.serials : undefined,
+          })),
+          payments,
+        }),
+      });
+      const raw = await res.text();
+      let data: CompletedSale & { error?: string; stkPending?: boolean } = {} as CompletedSale;
+      try {
+        data = raw ? JSON.parse(raw) : ({} as CompletedSale);
+      } catch {
+        setError(res.ok ? "Invalid server response" : "Sale failed");
         return;
       }
-      finishSale({ ...confirmed, changeDue: data.changeDue, cashTendered: data.cashTendered });
-      return;
+      if (!res.ok) {
+        setError(data.error || "Sale failed");
+        return;
+      }
+      if (data.stkPending) {
+        setError("Waiting for M-Pesa...");
+        const confirm = await fetch(`/api/sales/${data.id}/confirm-mpesa`, {
+          method: "POST",
+        });
+        const confirmRaw = await confirm.text();
+        let confirmed: CompletedSale & { error?: string } = {} as CompletedSale;
+        try {
+          confirmed = confirmRaw ? JSON.parse(confirmRaw) : ({} as CompletedSale);
+        } catch {
+          setError("M-Pesa confirmation failed");
+          return;
+        }
+        if (!confirm.ok) {
+          setError(confirmed.error || "M-Pesa not confirmed");
+          return;
+        }
+        finishSale({
+          ...confirmed,
+          changeDue: data.changeDue,
+          cashTendered: data.cashTendered,
+        });
+        return;
+      }
+      finishSale(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Sale failed");
+    } finally {
+      setLoading(false);
     }
-    finishSale(data);
   }
 
   function finishSale(sale: CompletedSale) {
@@ -697,7 +834,92 @@ export default function PosPage() {
   ];
 
   const disabledSell = tillOpen === false;
-  const canComplete = cart.length > 0 && !disabledSell && !loading;
+  const cashBlocksComplete = cashStatus === "missing" || cashStatus === "short";
+  const discountPct = discountMode === "5" ? 5 : discountMode === "10" ? 10 : 0;
+  const dueDateParsed = creditDueAt ? new Date(`${creditDueAt}T12:00:00`) : null;
+  const dueDateValid = Boolean(dueDateParsed && !Number.isNaN(dueDateParsed.getTime()));
+  const dueLabel = dueDateValid
+    ? dueDateParsed!.toLocaleDateString("en-GB", {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+        year: "numeric",
+      })
+    : "Pick a date";
+  const balanceAfterCreditSale = roundMoney(accountBalance + creditOnAccount);
+  const balanceAfterPayNow = roundMoney(accountBalance + appliedStoreCredit);
+  const methodLabel = METHODS.find((m) => m.id === payMethod)?.label || payMethod;
+  const depositMethodLabel =
+    METHODS.find((m) => m.id === depositMethod)?.label || depositMethod;
+
+  let creditChargeLabel = `Record credit · ${formatKes(netPutOnAccount)} on account`;
+  if (depositN > 0.01 && netPutOnAccount > 0.01) {
+    creditChargeLabel = `Deposit ${formatKes(depositN)} · on account ${formatKes(netPutOnAccount)}`;
+  } else if (depositN > 0.01 && netPutOnAccount <= 0.01) {
+    creditChargeLabel = `Charge deposit ${formatKes(depositN)} · ${depositMethodLabel}`;
+  } else if (netPutOnAccount <= 0.01 && storeCreditOnCreditSale > 0.01) {
+    creditChargeLabel = `Record sale · covered by store credit`;
+  } else if (netPutOnAccount <= 0.01) {
+    creditChargeLabel = `Record credit sale · ${formatKes(total)}`;
+  }
+
+  const chargeLabel = loading
+    ? "Processing…"
+    : disabledSell
+      ? "Open till to sell"
+      : cart.length === 0
+        ? "Add items to charge"
+        : onCredit
+          ? !customerId
+            ? "Select a customer for credit"
+            : !dueDateValid
+              ? "Set a credit due date"
+              : creditChargeLabel
+          : cashStatus === "missing"
+            ? `Enter cash tendered · need ${formatKes(amountDueNow)}`
+            : cashStatus === "short"
+              ? `Cash short · need ${formatKes(amountDueNow)}`
+              : appliedStoreCredit > 0.01 && amountDueNow <= 0.01
+                ? `Apply store credit · ${formatKes(total)}`
+                : appliedStoreCredit > 0.01
+                  ? `Charge ${formatKes(amountDueNow)} · Credit + ${methodLabel}`
+                  : `Charge ${formatKes(amountDueNow)} · ${methodLabel}`;
+
+  function formatAccountLine(balance: number): { label: string; value: string } {
+    if (balance > 0.009) {
+      return { label: "Balance owing", value: formatKes(balance) };
+    }
+    if (balance < -0.009) {
+      return { label: "Store credit available", value: formatKes(Math.abs(balance)) };
+    }
+    return { label: "Account balance", value: formatKes(0) };
+  }
+
+  function formatAfterSaleLine(balance: number): { label: string; value: string } {
+    if (balance > 0.009) {
+      return { label: "Balance after sale", value: formatKes(balance) };
+    }
+    if (balance < -0.009) {
+      return { label: "Store credit remaining", value: formatKes(Math.abs(balance)) };
+    }
+    return { label: "Account after sale", value: formatKes(0) };
+  }
+
+  const accountNow = formatAccountLine(accountBalance);
+  const accountAfterOnCredit = formatAfterSaleLine(balanceAfterCreditSale);
+  const accountAfterPayNow = formatAfterSaleLine(balanceAfterPayNow);
+  const creditBlocksComplete = onCredit && (!customerId || !dueDateValid);
+  const canComplete =
+    cart.length > 0 &&
+    !disabledSell &&
+    !loading &&
+    !cashBlocksComplete &&
+    !creditBlocksComplete;
+
+  function pickDueDays(days: number) {
+    setDueDays(days);
+    setCreditDueAt(ymdPlus(days));
+  }
 
   return (
     <div className="space-y-4">
@@ -710,30 +932,40 @@ export default function PosPage() {
         </div>
       )}
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="flex flex-wrap items-start gap-4">
         {/* LEFT: search, products, cart */}
-        <div className="space-y-3 min-w-0">
+        <section className="flex min-w-0 flex-[999_1_640px] flex-col gap-3.5">
           <div className="flex gap-2">
-            <input
-              className="sf-input flex-1"
-              placeholder="SKU, barcode, name, or category..."
-              disabled={disabledSell}
-              value={q}
-              onChange={(e) => {
-                setQ(e.target.value);
-                if (e.target.value.trim() && cat === "frequent") setCat("all");
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  addFromSearch();
-                }
-              }}
-              autoFocus
-            />
+            <div className="sf-pos-search">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" strokeLinecap="round" />
+              </svg>
+              <label htmlFor="pos-search" className="sr-only">
+                Search products
+              </label>
+              <input
+                id="pos-search"
+                type="text"
+                placeholder="Scan barcode or search SKU, name, category"
+                disabled={disabledSell}
+                value={q}
+                onChange={(e) => {
+                  setQ(e.target.value);
+                  if (e.target.value.trim() && cat === "frequent") setCat("all");
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    addFromSearch();
+                  }
+                }}
+                autoFocus
+              />
+            </div>
             <button
               type="button"
-              className="sf-btn sf-btn-primary shrink-0 px-4"
+              className="sf-pos-add shrink-0"
               disabled={disabledSell || !q.trim()}
               onClick={addFromSearch}
             >
@@ -741,7 +973,7 @@ export default function PosPage() {
             </button>
           </div>
 
-          <div className="flex gap-1.5 overflow-x-auto pb-0.5">
+          <div className="flex gap-2 overflow-x-auto pb-0.5">
             {chips.map((c) => (
               <button
                 key={c.id}
@@ -754,19 +986,24 @@ export default function PosPage() {
             ))}
           </div>
 
-          <div className="sf-pos-panel p-3">
+          <div className="flex flex-col gap-2.5">
+            <span className="text-[11px] font-semibold uppercase tracking-[0.05em] text-[var(--sf-muted)]">
+              {cat === "frequent" && !q.trim()
+                ? "Frequent items · tap to add"
+                : "Products · tap to add"}
+            </span>
             {cat === "frequent" && !q.trim() && !filtered.length ? (
-              <p className="py-10 text-center text-sm text-slate-500">
+              <p className="rounded-lg border border-[var(--sf-border)] bg-white px-3 py-5 text-center text-xs text-[var(--sf-muted)]">
                 No frequently sold products yet. Products you sell will appear here.
               </p>
             ) : !filtered.length ? (
-              <p className="py-10 text-center text-sm text-slate-500">
+              <p className="rounded-lg border border-[var(--sf-border)] bg-white px-3 py-5 text-center text-xs text-[var(--sf-muted)]">
                 {cat !== "all" && cat !== "frequent" && !q.trim()
                   ? "No products in this category."
                   : "No products found. Try a different search term."}
               </p>
             ) : (
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
                 {filtered.map((p) => (
                   <ProductTile key={p.id} p={p} onAdd={addProduct} disabled={disabledSell} />
                 ))}
@@ -803,6 +1040,7 @@ export default function PosPage() {
                           <p className="text-xs text-slate-500">
                             {h.cart.length} items · {formatKes(Math.max(0, total))} ·{" "}
                             {heldAgeLabel(h.heldAt)}
+                            {h.cashierName ? ` · ${h.cashierName}` : ""}
                           </p>
                         </div>
                         <div className="flex shrink-0 items-center gap-1.5">
@@ -832,92 +1070,93 @@ export default function PosPage() {
           )}
 
           <div className="sf-pos-panel overflow-hidden">
-            <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-4 py-3">
-              <div>
-                <h2 className="font-semibold text-[var(--sf-brand)]">Cart</h2>
-                <p className="text-xs text-slate-500">
-                  {cart.length} item(s). Remove or change quantity below.
+            <div className="flex items-center justify-between gap-2 border-b border-[#ECE9E2] px-3 py-2">
+              <div className="flex flex-col gap-0.5">
+                <h2 className="sf-display text-sm font-bold text-[var(--sf-brand)]">Cart</h2>
+                <p className="text-[11px] text-[var(--sf-muted)]">
+                  {cart.length} item(s) · edit price or quantity inline
                 </p>
               </div>
-              {cart.length > 0 && (
-                <button
-                  type="button"
-                  className="sf-btn sf-btn-ghost inline-flex shrink-0 items-center gap-1.5 px-2.5 py-1.5 text-xs"
-                  title="Hold sale (F3)"
-                  disabled={loading}
-                  onClick={holdCurrentSale}
-                >
-                  <IconPause />
-                  Hold
-                </button>
-              )}
+              <button
+                type="button"
+                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-[var(--sf-border)] bg-white px-2.5 text-[11px] font-semibold text-[var(--sf-brand)] disabled:opacity-40"
+                title="Hold sale (F3)"
+                disabled={!cart.length || loading}
+                onClick={holdCurrentSale}
+              >
+                <IconPause className="h-3.5 w-3.5" />
+                Hold sale
+              </button>
             </div>
-            <ul className="max-h-[280px] space-y-2 overflow-y-auto px-3 py-2">
+            <ul className="max-h-[min(420px,50vh)] overflow-y-auto">
               {!cart.length ? (
-                <li className="py-8 text-center text-sm text-slate-500">Cart is empty.</li>
+                <li className="px-3 py-5 text-center text-xs text-[var(--sf-muted)]">
+                  Cart is empty. Scan an item or tap a frequent item above.
+                </li>
               ) : (
                 cart.map((item) => {
-                  const unit =
-                    levelOff > 0
-                      ? roundMoney(item.unitPrice * (1 - levelOff / 100))
-                      : item.unitPrice;
+                  const unit = lineUnit(item);
                   const lineTotal = roundMoney(unit * item.qty);
-                  const decimal = allowsDecimal(item.unit);
-                  const qtyLabel =
-                    decimal && item.qty % 1 !== 0 ? item.qty.toFixed(2) : String(item.qty);
-                  const initials = item.name
-                    .split(/\s+/)
-                    .slice(0, 2)
-                    .map((w) => w[0])
-                    .join("")
-                    .toUpperCase();
+                  const listPrice =
+                    products.find((p) => p.id === item.productId)?.sellPrice ?? item.unitPrice;
+                  const belowList = item.priceOverridden && listPrice - unit > 0.004;
+                  const code = productCode(item.name, item.productId);
+                  const tone = productTileTone(item.productId || item.name);
                   return (
                     <li
                       key={item.productId}
-                      className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white p-2"
+                      className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-[#ECE9E2] px-3 py-2 last:border-b-0"
                     >
-                      <div className="flex min-w-0 items-center gap-3">
-                        <div className="h-10 w-10 shrink-0 overflow-hidden rounded-md border border-slate-200 bg-slate-50">
-                          {item.imageUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img
-                              src={item.imageUrl}
-                              alt=""
-                              className="h-full w-full object-cover"
-                            />
-                          ) : (
-                            <span className="grid h-full w-full place-items-center text-[10px] font-bold text-[var(--sf-brand)]">
-                              {initials}
+                      <div className="flex min-w-[180px] flex-[1_1_180px] items-center gap-2">
+                        <span
+                          className="sf-display grid size-8 shrink-0 place-items-center rounded-md text-[11px] font-bold"
+                          style={{ background: tone.tint, color: tone.ink }}
+                        >
+                          {code}
+                        </span>
+                        <div className="flex min-w-0 flex-col gap-0.5">
+                          <span className="truncate text-xs font-semibold">{item.name}</span>
+                          <span className="text-[11px] text-[var(--sf-muted)]">
+                            List {formatKes(listPrice)} / {item.unit}
+                          </span>
+                          {belowList && (
+                            <span className="w-fit rounded bg-[#FFF4D6] px-1.5 py-0.5 text-[10px] font-semibold text-[#7A4B00]">
+                              Price changed · {formatKes(listPrice - unit)} below list
+                            </span>
+                          )}
+                          {item.trackSerial && item.serials.length > 0 && (
+                            <span className="font-mono text-[10px] text-[var(--sf-muted)]">
+                              S/N {item.serials.join(", ")}
                             </span>
                           )}
                         </div>
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-semibold text-[var(--sf-brand)]">
-                            {item.name}
-                          </div>
-                          <div className="text-xs text-slate-500 tabular-nums">
-                            {decimal ? (
-                              <>
-                                {qtyLabel} {item.unit} @ {formatKes(unit)}/{item.unit} ={" "}
-                                {formatKes(lineTotal)}
-                              </>
-                            ) : (
-                              <>
-                                {formatKes(unit)} × {item.qty} = {formatKes(lineTotal)}
-                              </>
-                            )}
-                          </div>
-                          {item.trackSerial && item.serials.length > 0 && (
-                            <div className="font-mono text-[10px] text-slate-400">
-                              S/N {item.serials.join(", ")}
-                            </div>
-                          )}
-                        </div>
                       </div>
-                      <div className="flex shrink-0 items-center gap-1.5">
+
+                      <div className="flex flex-col gap-0.5">
+                        <label className="text-[10px] font-semibold text-[var(--sf-muted)]">
+                          Unit price
+                        </label>
+                        {canDiscount ? (
+                          <CartPriceInput
+                            value={unit}
+                            label={`Price for ${item.name}`}
+                            onChange={(price) => setLinePrice(item.productId, String(price))}
+                          />
+                        ) : (
+                          <div className="flex h-8 w-[7.75rem] items-center gap-1 rounded-md border-[1.5px] border-[var(--sf-border-strong)] bg-white px-2 text-xs font-semibold tabular-nums">
+                            <span className="text-[11px] text-[var(--sf-muted)]">KSh</span>
+                            <span className="flex-1 text-right">{unit.toFixed(2)}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[10px] font-semibold text-[var(--sf-muted)]">
+                          Quantity ({item.unit})
+                        </span>
                         {item.trackSerial ? (
-                          <span className="sf-badge bg-slate-50 text-slate-600">
-                            {item.qty} {item.unit}
+                          <span className="inline-flex h-8 min-w-[6.5rem] items-center justify-center rounded-md border-[1.5px] border-[var(--sf-border-strong)] bg-white px-2.5 text-xs font-bold tabular-nums">
+                            {item.qty}
                           </span>
                         ) : (
                           <QtyStepper
@@ -934,249 +1173,292 @@ export default function PosPage() {
                             }
                           />
                         )}
-                        <button
-                          type="button"
-                          className="sf-cart-remove sf-cart-remove-icon"
-                          aria-label={`Remove ${item.name}`}
-                          title="Remove"
-                          onClick={() =>
-                            setCart((prev) => prev.filter((i) => i.productId !== item.productId))
-                          }
-                        >
-                          <IconTrash className="h-4 w-4" />
-                        </button>
                       </div>
+
+                      <div className="flex min-w-[88px] max-w-[140px] flex-[1_1_88px] flex-col items-end gap-0.5">
+                        <span className="text-[10px] font-semibold text-[var(--sf-muted)]">
+                          Line total
+                        </span>
+                        <span className="sf-money sf-money-md">{formatKes(lineTotal)}</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="grid size-8 place-items-center rounded-md border border-[#F0B4AE] bg-[#FEF1F0] text-[#B42318]"
+                        aria-label={`Remove ${item.name}`}
+                        title="Remove"
+                        onClick={() =>
+                          setCart((prev) => prev.filter((i) => i.productId !== item.productId))
+                        }
+                      >
+                        <IconTrash className="h-3.5 w-3.5" />
+                      </button>
                     </li>
                   );
                 })
               )}
             </ul>
           </div>
-        </div>
+        </section>
 
-        {/* RIGHT: totals → discount → promo → payment */}
-        <aside className="space-y-3 xl:sticky xl:top-20 xl:self-start">
-          <div className="sf-pos-panel p-4">
-            <h3 className="font-semibold text-[var(--sf-brand)]">Totals</h3>
-            <p className="mt-0.5 text-xs text-slate-500">
-              VAT {settings?.vatPercent ?? 0}%{" "}
-              {settings?.pricesIncludeVat ? "inclusive" : "exclusive"}. Optional discount or promo
-              below.
-            </p>
-            <div className="mt-3 space-y-1.5 text-sm">
-              <div className="flex justify-between text-slate-600">
-                <span>Subtotal {settings?.pricesIncludeVat ? "(inc VAT)" : ""}</span>
-                <span className="tabular-nums">{formatKes(subtotal)}</span>
+        {/* RIGHT: totals → discount → payment */}
+        <aside className="flex w-full min-w-0 max-w-[460px] flex-[1_1_320px] flex-col gap-3 xl:sticky xl:top-20">
+          <div className="sf-pos-panel flex min-w-0 flex-col gap-1.5 overflow-hidden p-3">
+            <div className="flex items-baseline justify-between gap-3">
+              <h3 className="sf-display text-sm font-bold">Totals</h3>
+              <span className="shrink-0 text-[10px] text-[var(--sf-muted)]">
+                Prices include {settings?.vatPercent ?? 16}% VAT
+              </span>
+            </div>
+            <div className="sf-totals-row text-xs text-[#3A4452]">
+              <span>Subtotal</span>
+              <span className="sf-money">{formatKes(subtotal)}</span>
+            </div>
+            {discount > 0 && (
+              <div className="sf-totals-row text-xs text-[#166534]">
+                <span>Discount{discountPct > 0 ? ` (${discountPct}%)` : ""}</span>
+                <span className="sf-money">− {formatKes(discount)}</span>
               </div>
-              {levelOff > 0 && (
-                <div className="flex justify-between text-slate-500">
-                  <span>Price level</span>
-                  <span>-{levelOff}%</span>
-                </div>
-              )}
-              {discount > 0 && (
-                <div className="flex justify-between text-slate-500">
-                  <span>Discount</span>
-                  <span className="tabular-nums">-{formatKes(discount)}</span>
-                </div>
-              )}
-              <div className="flex justify-between text-slate-500">
-                <span>VAT</span>
-                <span className="tabular-nums">{formatKes(taxInfo.taxAmount)}</span>
+            )}
+            {levelOff > 0 && (
+              <div className="sf-totals-row text-xs text-[#166534]">
+                <span>Price level ({levelOff}%)</span>
+                <span>applied on lines</span>
               </div>
-              <div className="flex justify-between border-t border-slate-100 pt-2 text-base font-semibold text-[var(--sf-brand)]">
-                <span>Total</span>
-                <span className="tabular-nums">{formatKes(total)}</span>
-              </div>
+            )}
+            <div className="sf-totals-row text-[11px] text-[var(--sf-muted)]">
+              <span>of which VAT {settings?.vatPercent ?? 16}%</span>
+              <span className="sf-money">{formatKes(taxInfo.taxAmount)}</span>
+            </div>
+            <div className="h-px bg-[#ECE9E2]" />
+            <div className="flex min-w-0 items-baseline justify-between gap-3">
+              <span className="sf-display text-sm font-bold">Total</span>
+              <span className="sf-money sf-money-lg">{formatKes(total)}</span>
             </div>
           </div>
 
-          <div className="sf-pos-panel p-4">
-            <h3 className="font-semibold text-[var(--sf-brand)]">Discount</h3>
-            <select
-              className="sf-input mt-2"
-              value={discountMode}
-              disabled={!canDiscount}
-              onChange={(e) =>
-                setDiscountMode(e.target.value as "none" | "5" | "10" | "custom")
-              }
-            >
-              <option value="none">None</option>
-              <option value="5">5%</option>
-              <option value="10">10%</option>
-              <option value="custom">Custom amount</option>
-            </select>
+          <div className="sf-pos-panel flex flex-col gap-2.5 p-3">
+            <div className="flex flex-wrap gap-2.5">
+              <SelectMenu
+                id="pos-disc"
+                className="min-w-[120px] flex-1"
+                label="Discount"
+                value={discountMode}
+                disabled={!canDiscount}
+                options={DISCOUNT_OPTIONS}
+                onChange={(v) => setDiscountMode(v as "none" | "5" | "10" | "custom")}
+              />
+              <div className="flex min-w-[180px] flex-[2] flex-col gap-0.5">
+                <label htmlFor="pos-promo" className="text-[11px] font-semibold text-[var(--sf-muted)]">
+                  Promo code
+                </label>
+                <div className="flex gap-1.5">
+                  <input
+                    id="pos-promo"
+                    className="h-8 min-w-0 flex-1 rounded-md border-[1.5px] border-[var(--sf-border-strong)] px-2 text-xs"
+                    placeholder="Enter code"
+                    value={promoCode}
+                    onChange={(e) => {
+                      setPromoCode(e.target.value);
+                      setPromoMsg("");
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="h-8 rounded-md border border-[var(--sf-border)] bg-white px-2.5 text-[11px] font-semibold"
+                    disabled={!promoCode.trim()}
+                    onClick={applyPromo}
+                  >
+                    Apply
+                  </button>
+                </div>
+              </div>
+            </div>
             {discountMode === "custom" && canDiscount && (
               <input
                 type="number"
-                className="sf-input mt-2"
-                placeholder="KSh"
+                className="sf-input"
+                placeholder="Custom discount KSh"
                 value={discount || ""}
                 onChange={(e) => setDiscount(Number(e.target.value) || 0)}
               />
             )}
+            {promoMsg && <p className="text-xs text-[var(--sf-muted)]">{promoMsg}</p>}
             {!canDiscount && (
-              <p className="mt-1 text-[11px] text-slate-500">Only managers can set order discounts.</p>
+              <p className="text-[11px] text-[var(--sf-muted)]">Only managers can set order discounts.</p>
             )}
           </div>
 
-          <div className="sf-pos-panel p-4">
-            <h3 className="font-semibold text-[var(--sf-brand)]">Promo code</h3>
-            <div className="mt-2 flex gap-2">
-              <input
-                className="sf-input flex-1"
-                placeholder="Enter promo code"
-                value={promoCode}
-                onChange={(e) => {
-                  setPromoCode(e.target.value);
-                  setPromoMsg("");
-                }}
-              />
+          <div className="sf-pos-panel flex flex-col gap-2.5 p-3">
+            <h3 className="sf-display text-sm font-bold">Payment</h3>
+
+            <div className="sf-pos-seg">
               <button
                 type="button"
-                className="sf-btn sf-btn-ghost"
-                disabled={!promoCode.trim()}
-                onClick={applyPromo}
+                data-on={!onCredit ? "true" : "false"}
+                onClick={() => {
+                  setOnCredit(false);
+                }}
               >
-                Apply
+                Pay now
               </button>
-            </div>
-            {promoMsg && <p className="mt-1 text-xs text-slate-600">{promoMsg}</p>}
-          </div>
-
-          <div className="sf-pos-panel p-4">
-            <h3 className="font-semibold text-[var(--sf-brand)]">Payment</h3>
-            <div className="mt-3 flex flex-wrap gap-4">
               {canCredit && (
-                <Switch
-                  on={onCredit}
-                  label="On credit"
-                  onToggle={() => {
-                    setOnCredit((v) => !v);
+                <button
+                  type="button"
+                  data-on={onCredit ? "true" : "false"}
+                  onClick={() => {
+                    setOnCredit(true);
                     setSplit(false);
                   }}
-                />
-              )}
-              {!onCredit && (
-                <Switch
-                  on={split}
-                  label="Split payment"
-                  onToggle={() => {
-                    setSplit((v) => !v);
-                    setOnCredit(false);
-                  }}
-                />
+                >
+                  On credit
+                </button>
               )}
             </div>
 
             {onCredit ? (
-              <div className="mt-3 space-y-3">
-                <label className="block text-sm">
-                  Customer
-                  <select
-                    className="sf-input mt-1"
-                    value={customerId}
-                    onChange={(e) => setCustomerId(e.target.value)}
-                  >
-                    <option value="">Select customer</option>
-                    {customers.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                        {c.balance > 0 ? ` — bal ${formatKes(c.balance)}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                  {selectedCustomer && (
-                    <span className="mt-1 block text-[11px] text-slate-600">
-                      Previous balance:{" "}
-                      <span className="font-semibold tabular-nums">
-                        {formatKes(selectedCustomer.balance)}
-                      </span>
-                    </span>
+              <div className="flex flex-col gap-2.5">
+                <CustomerPicker
+                  customers={customers}
+                  value={customerId}
+                  onChange={setCustomerId}
+                  onCreated={addCustomerToList}
+                  label="Customer"
+                  emptyLabel="Select customer"
+                  allowEmpty
+                />
+                <div className="flex flex-col gap-1 rounded-lg bg-[var(--sf-surface-2)] px-3 py-2 text-xs">
+                  <div className="flex justify-between gap-3 text-[#3A4452]">
+                    <span>{accountNow.label}</span>
+                    <span className="tabular-nums">{accountNow.value}</span>
+                  </div>
+                  <div className="flex justify-between gap-3 text-[#3A4452]">
+                    <span>This sale total</span>
+                    <span className="tabular-nums">{formatKes(total)}</span>
+                  </div>
+                  {storeCreditOnCreditSale > 0.009 && (
+                    <div className="flex justify-between gap-3 text-[#3A4452]">
+                      <span>Store credit applied</span>
+                      <span className="tabular-nums">− {formatKes(storeCreditOnCreditSale)}</span>
+                    </div>
                   )}
-                  <span className="mt-1 block text-[11px] text-slate-500">
-                    A credit sale needs a real customer so the debt can be collected later.
+                  {depositN > 0.009 && (
+                    <div className="flex justify-between gap-3 text-[#3A4452]">
+                      <span>Deposit now</span>
+                      <span className="tabular-nums">− {formatKes(depositN)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between gap-3 text-[#3A4452]">
+                    <span>Put on account</span>
+                    <span className="tabular-nums">{formatKes(netPutOnAccount)}</span>
+                  </div>
+                  <div className="h-px bg-[var(--sf-border)]" />
+                  <div className="flex justify-between gap-3 font-bold">
+                    <span>{accountAfterOnCredit.label}</span>
+                    <span className="tabular-nums">{accountAfterOnCredit.value}</span>
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[11px] font-semibold text-[var(--sf-muted)]">
+                    Due date · {dueLabel}
                   </span>
-                </label>
-                <label className="block text-sm">
-                  Due date
+                  <div className="flex gap-1.5">
+                    {[7, 14, 30].map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        className="sf-pos-pill"
+                        data-on={dueDays === d ? "true" : "false"}
+                        onClick={() => pickDueDays(d)}
+                      >
+                        {d} days
+                      </button>
+                    ))}
+                  </div>
                   <input
                     type="date"
-                    className="sf-input mt-1"
+                    className="sf-input"
                     value={creditDueAt}
-                    onChange={(e) => setCreditDueAt(e.target.value)}
+                    onChange={(e) => {
+                      setCreditDueAt(e.target.value);
+                      setDueDays(0);
+                    }}
                   />
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="block text-sm">
-                    Deposit method
-                    <select
-                      className="sf-input mt-1"
-                      value={depositMethod}
-                      onChange={(e) => setDepositMethod(e.target.value as PayMethod)}
+                </div>
+                <div className="grid grid-cols-1 items-end gap-2 sm:grid-cols-2">
+                  <SelectMenu
+                    label="Deposit method"
+                    value={depositMethod}
+                    options={METHOD_OPTIONS}
+                    onChange={(v) => setDepositMethod(v as PayMethod)}
+                  />
+                  <div>
+                    <label
+                      htmlFor="pos-deposit-amt"
+                      className="text-[11px] font-semibold text-[var(--sf-muted)]"
                     >
-                      {METHODS.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block text-sm">
-                    Deposit now (optional)
+                      Deposit now{" "}
+                      <span className="font-normal">(optional)</span>
+                    </label>
                     <input
-                      className="sf-input mt-1"
+                      id="pos-deposit-amt"
+                      className="mt-1 h-8 w-full rounded-md border-[1.5px] border-[var(--sf-border-strong)] bg-white px-2.5 text-xs outline-none focus:border-[var(--sf-accent)] focus:shadow-[0_0_0_3px_var(--sf-accent-soft)]"
                       inputMode="decimal"
                       placeholder="0"
                       value={depositAmount}
                       onChange={(e) => setDepositAmount(e.target.value)}
                     />
-                  </label>
+                  </div>
                 </div>
                 {depositMethod === "MPESA" && Number(depositAmount) > 0 && (
-                  <label className="block text-sm">
+                  <label className="block text-xs">
                     M-Pesa phone
                     <input
                       className="sf-input mt-1"
-                      placeholder="07xxxxxxxx"
+                      placeholder="07xxxxxxxx — leave blank for till payment"
                       value={mpesaPhone}
                       onChange={(e) => setMpesaPhone(e.target.value)}
                     />
                   </label>
                 )}
-                <p className="text-sm font-medium text-[var(--sf-brand)]">
-                  On credit: {formatKes(creditBalance)}
-                </p>
               </div>
             ) : split ? (
-              <div className="mt-3 space-y-3">
-                <p className="text-xs text-slate-500">
-                  Amount per method (must equal total). Enter at least two amounts, or turn split
-                  off to take one payment.
-                </p>
+              <div className="mt-1 space-y-2">
+                <CustomerPicker
+                  customers={customers}
+                  value={customerId}
+                  onChange={setCustomerId}
+                  onCreated={addCustomerToList}
+                  label="Customer (optional)"
+                  emptyLabel="Walk-in"
+                  allowEmpty
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[11px] text-[var(--sf-muted)]">
+                    Amount per method must equal total. Enter at least two amounts.
+                  </p>
+                  <button
+                    type="button"
+                    className="shrink-0 text-[11px] font-semibold text-[var(--sf-muted)] underline-offset-2 hover:underline"
+                    onClick={() => setSplit(false)}
+                  >
+                    Single method
+                  </button>
+                </div>
                 {splits.map((line, idx) => (
                   <div key={idx} className="flex items-end gap-2">
-                    <label className="min-w-0 flex-1 text-sm">
-                      Payment {idx + 1} method
-                      <select
-                        className="sf-input mt-1"
-                        value={line.method}
-                        onChange={(e) =>
-                          setSplits((prev) =>
-                            prev.map((s, i) =>
-                              i === idx ? { ...s, method: e.target.value as PayMethod } : s
-                            )
-                          )
-                        }
-                      >
-                        {METHODS.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="w-28 text-sm">
+                    <SelectMenu
+                      className="min-w-0 flex-1"
+                      label={`Payment ${idx + 1} method`}
+                      value={line.method}
+                      options={METHOD_OPTIONS}
+                      onChange={(v) =>
+                        setSplits((prev) =>
+                          prev.map((s, i) => (i === idx ? { ...s, method: v as PayMethod } : s))
+                        )
+                      }
+                    />
+                    <label className="w-28 text-xs">
                       Amount
                       <input
                         className="sf-input mt-1"
@@ -1203,11 +1485,12 @@ export default function PosPage() {
                   </div>
                 ))}
                 {splits.some((s) => s.method === "MPESA") && (
-                  <label className="block text-sm">
+                  <label className="block text-xs">
                     M-Pesa phone
+                    <span className="ml-1 font-normal text-slate-500">(optional)</span>
                     <input
                       className="sf-input mt-1"
-                      placeholder="07xxxxxxxx"
+                      placeholder="07xxxxxxxx — leave blank for till payment"
                       value={mpesaPhone}
                       onChange={(e) => setMpesaPhone(e.target.value)}
                     />
@@ -1226,96 +1509,117 @@ export default function PosPage() {
                 )}
               </div>
             ) : (
-              <div className="mt-3 space-y-3">
-                <label className="block text-sm">
-                  Method
-                  <select
-                    className="sf-input mt-1"
-                    value={payMethod}
-                    onChange={(e) => setPayMethod(e.target.value as PayMethod)}
-                  >
-                    {METHODS.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {payMethod === "CASH" && (
-                  <label className="block text-sm">
+              <div className="flex flex-col gap-2">
+                <CustomerPicker
+                  customers={customers}
+                  value={customerId}
+                  onChange={setCustomerId}
+                  onCreated={addCustomerToList}
+                  label="Customer (optional)"
+                  emptyLabel="Walk-in"
+                  allowEmpty
+                />
+                {customerId && storeCredit > 0.009 && (
+                  <div className="flex flex-col gap-1 rounded-lg bg-[#E7F5EC] px-3 py-2 text-xs text-[#14532D]">
+                    <div className="flex justify-between gap-3">
+                      <span>Store credit available</span>
+                      <span className="tabular-nums font-semibold">{formatKes(storeCredit)}</span>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <span>Applied to this sale</span>
+                      <span className="tabular-nums font-semibold">
+                        − {formatKes(appliedStoreCredit)}
+                      </span>
+                    </div>
+                    <div className="h-px bg-[#B7DFC4]" />
+                    <div className="flex justify-between gap-3 font-bold">
+                      <span>Collect now</span>
+                      <span className="tabular-nums">{formatKes(amountDueNow)}</span>
+                    </div>
+                    {appliedStoreCredit > 0.009 && (
+                      <div className="flex justify-between gap-3 text-[11px] text-[#166534]">
+                        <span>{accountAfterPayNow.label}</span>
+                        <span className="tabular-nums">{accountAfterPayNow.value}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {amountDueNow > 0.01 && (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[11px] font-semibold text-[var(--sf-muted)]">Method</span>
+                    <div className="flex gap-1.5">
+                      {METHODS.filter((m) => m.id !== "BANK").map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          className="sf-pos-pill"
+                          data-on={payMethod === m.id ? "true" : "false"}
+                          onClick={() => {
+                            setPayMethod(m.id);
+                            setSplit(false);
+                          }}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {amountDueNow > 0.01 && payMethod === "CASH" && (
+                  <label className="block text-xs">
                     Cash tendered
                     <input
                       className="sf-input mt-1"
                       inputMode="decimal"
-                      placeholder={String(total || 0)}
+                      placeholder={String(amountDueNow || 0)}
                       value={cashTendered}
                       onChange={(e) => setCashTendered(e.target.value)}
                     />
                   </label>
                 )}
-                {payMethod === "MPESA" && (
-                  <label className="block text-sm">
+                {amountDueNow > 0.01 && payMethod === "MPESA" && (
+                  <label className="block text-xs">
                     M-Pesa phone
+                    <span className="ml-1 font-normal text-[var(--sf-muted)]">(optional)</span>
                     <input
                       className="sf-input mt-1"
-                      placeholder="07xxxxxxxx"
+                      placeholder="07xxxxxxxx — leave blank for till payment"
                       value={mpesaPhone}
                       onChange={(e) => setMpesaPhone(e.target.value)}
                     />
                   </label>
                 )}
                 {changeDue > 0 && (
-                  <p className="rounded-lg bg-teal-50 px-3 py-2 text-sm font-medium text-teal-900">
+                  <p className="rounded-lg bg-[#E7F5EC] px-2.5 py-1.5 text-xs font-medium text-[#14532D]">
                     Change due: {formatKes(changeDue)}
                   </p>
                 )}
+                <button
+                  type="button"
+                  className="text-left text-[11px] font-semibold text-[var(--sf-muted)] underline-offset-2 hover:underline"
+                  onClick={() => {
+                    setSplit(true);
+                    setOnCredit(false);
+                  }}
+                >
+                  Split across methods
+                </button>
               </div>
             )}
 
-            {/* Customer for price levels when not on credit */}
-            {!onCredit && (
-              <label className="mt-3 block text-sm">
-                Customer (optional)
-                <select
-                  className="sf-input mt-1"
-                  value={customerId}
-                  onChange={(e) => setCustomerId(e.target.value)}
-                >
-                  <option value="">Walk-in</option>
-                  {customers.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-          </div>
+            {error && <p className="sf-alert sf-alert-error">{error}</p>}
 
-          {error && <p className="sf-alert sf-alert-error">{error}</p>}
-
-          <div className="grid gap-2">
             <button
               type="button"
               disabled={!canComplete}
               onClick={checkout}
-              className="sf-btn w-full py-3.5 text-base font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-              style={{
-                background: canComplete ? "var(--sf-brand)" : "#94a3b8",
-                color: "#fff",
-              }}
+              className="sf-pos-charge"
             >
-              {loading
-                ? "Processing..."
-                : disabledSell
-                  ? "Open till to sell"
-                  : cart.length === 0
-                    ? "Complete sale"
-                    : `Complete sale · ${formatKes(total)}`}
+              {chargeLabel}
             </button>
             <button
               type="button"
-              className="sf-btn sf-btn-ghost w-full"
+              className="h-8 rounded-md border border-[var(--sf-border)] bg-white text-[11px] font-semibold text-[var(--sf-brand)] disabled:opacity-40"
               disabled={!cart.length || loading}
               title="Print a bill for the customer to review before paying"
               onClick={() => setBillOpen(true)}
@@ -1343,7 +1647,7 @@ export default function PosPage() {
               <button
                 type="button"
                 className="sf-btn sf-btn-primary"
-                onClick={() => window.print()}
+                onClick={() => printThermalReceipt()}
               >
                 Print
               </button>
@@ -1385,7 +1689,7 @@ export default function PosPage() {
               <button
                 type="button"
                 className="sf-btn sf-btn-primary"
-                onClick={() => window.print()}
+                onClick={() => printThermalReceipt()}
               >
                 Print
               </button>
@@ -1411,6 +1715,32 @@ export default function PosPage() {
   );
 }
 
+const PRODUCT_TILE_TONES = [
+  { tint: "#EFE9FB", ink: "#4C2A8A" },
+  { tint: "#DDF3EE", ink: "#0F5E50" },
+  { tint: "#FBF0D2", ink: "#7A4B00" },
+  { tint: "#FDE8E4", ink: "#9A3412" },
+  { tint: "#E7F0FB", ink: "#1E3A8A" },
+  { tint: "#E8F5E9", ink: "#14532D" },
+  { tint: "#F3E8FF", ink: "#6B21A8" },
+  { tint: "#ECFDF5", ink: "#065F46" },
+] as const;
+
+function productTileTone(seed: string) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h + seed.charCodeAt(i) * (i + 1)) % PRODUCT_TILE_TONES.length;
+  return PRODUCT_TILE_TONES[h];
+}
+
+function productCode(name: string, seed?: string) {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    return (words[0][0] + words[1][0]).toUpperCase();
+  }
+  const base = (seed || name).replace(/[^a-zA-Z0-9]/g, "");
+  return (base.slice(0, 2) || "??").toUpperCase();
+}
+
 function ProductTile({
   p,
   onAdd,
@@ -1420,36 +1750,34 @@ function ProductTile({
   onAdd: (p: Product) => void;
   disabled?: boolean;
 }) {
-  const initials = p.name
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((w) => w[0])
-    .join("")
-    .toUpperCase();
+  const code = productCode(p.name, p.sku || p.id);
+  const tone = productTileTone(p.id || p.name);
   return (
     <button
       type="button"
       onClick={() => onAdd(p)}
       disabled={disabled || p.qty <= 0}
-      className="sf-product-tile"
+      className="flex min-h-[52px] items-center gap-2 rounded-lg border border-[var(--sf-border)] bg-white px-2.5 py-2 text-left text-[var(--sf-brand)] transition hover:border-[var(--sf-border-strong)] hover:bg-[var(--sf-surface-2)] disabled:cursor-not-allowed disabled:opacity-40"
     >
-      <div className="flex items-start gap-2">
-        {p.imageUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={p.imageUrl} alt="" className="h-9 w-9 rounded-lg object-cover ring-1 ring-slate-200" />
-        ) : (
-          <span className="sf-product-avatar">{initials}</span>
-        )}
-        <div className="min-w-0 flex-1">
-          <div className="line-clamp-2 text-[13px] font-semibold leading-snug text-[var(--sf-brand)]">
-            {p.name}
-          </div>
-          <div className="mt-1 text-[13px] font-semibold tabular-nums text-slate-800">
-            {formatKes(p.sellPrice)}
-            <span className="font-normal text-slate-400">/{p.unit}</span>
-          </div>
-        </div>
-      </div>
+      {p.imageUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={p.imageUrl} alt="" className="size-8 shrink-0 rounded-md object-cover" />
+      ) : (
+        <span
+          className="sf-display grid size-8 shrink-0 place-items-center rounded-md text-[11px] font-bold"
+          style={{ background: tone.tint, color: tone.ink }}
+        >
+          {code}
+        </span>
+      )}
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <span className="truncate text-xs font-semibold">{p.name}</span>
+        <span className="text-[11px] text-[var(--sf-muted)]">
+          <b className="font-semibold tabular-nums text-[var(--sf-brand)]">{formatKes(p.sellPrice)}</b>
+          {" / "}
+          {p.unit}
+        </span>
+      </span>
     </button>
   );
 }

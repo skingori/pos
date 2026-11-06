@@ -39,4 +39,4 @@ Seed accounts must change password on first login. Production seed requires `ALL
 - Settings, users, audit logs, forced password change
 
 M-Pesa: leave Daraja env vars empty for mock STK.  
-Docs: [`docs/demo-vercel.md`](docs/demo-vercel.md) · [`docs/kenya-hardware-pos-mvp.md`](docs/kenya-hardware-pos-mvp.md) · [`docs/production.md`](docs/production.md) · [`docs/commercial-pilot.md`](docs/commercial-pilot.md)
+Docs: [`docs/contabo.md`](docs/contabo.md) (Contabo VPS) · [`docs/demo-vercel.md`](docs/demo-vercel.md) · [`docs/kenya-hardware-pos-mvp.md`](docs/kenya-hardware-pos-mvp.md) · [`docs/production.md`](docs/production.md) · [`docs/commercial-pilot.md`](docs/commercial-pilot.md)

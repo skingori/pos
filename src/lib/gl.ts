@@ -17,6 +17,7 @@ const CODES = {
   COGS: "5000",
   REFUND_EXP: "5200",
   WRITE_OFF: "5300",
+  BAD_DEBT: "5400",
 } as const;
 
 export async function ensureChartOfAccounts(tx: Tx = prisma) {
@@ -37,6 +38,7 @@ export async function ensureChartOfAccounts(tx: Tx = prisma) {
     { code: CODES.COGS, name: "Cost of goods sold", type: "COGS" },
     { code: CODES.REFUND_EXP, name: "Sales returns", type: "EXPENSE" },
     { code: CODES.WRITE_OFF, name: "Inventory write-off", type: "EXPENSE" },
+    { code: CODES.BAD_DEBT, name: "Bad debt / credit write-off", type: "EXPENSE" },
   ];
   for (const a of accounts) {
     await tx.account.upsert({
@@ -157,6 +159,42 @@ export async function postPurchaseJournal(
   });
 }
 
+/** Reverse an unsettled credit sale that was voided (restock + clear AR). */
+export async function postVoidCreditJournal(
+  tx: Tx,
+  sale: {
+    id: string;
+    receiptNo: number;
+    openAmount: number;
+    total: number;
+    taxAmount: number;
+    costTotal: number;
+  }
+) {
+  if (sale.openAmount <= 0.009) return null;
+  const ratio =
+    sale.total > 0.009 ? Math.min(1, sale.openAmount / sale.total) : 1;
+  const netSales = roundMoney((sale.total - (sale.taxAmount || 0)) * ratio);
+  const vat = roundMoney((sale.taxAmount || 0) * ratio);
+  const cost = roundMoney((sale.costTotal || 0) * ratio);
+
+  const lines: { code: string; debit?: number; credit?: number }[] = [];
+  lines.push({ code: CODES.AR, credit: sale.openAmount });
+  if (netSales > 0) lines.push({ code: CODES.SALES, debit: netSales });
+  if (vat > 0) lines.push({ code: CODES.VAT, debit: vat });
+  if (cost > 0) {
+    lines.push({ code: CODES.INVENTORY, debit: cost });
+    lines.push({ code: CODES.COGS, credit: cost });
+  }
+
+  return postJournal(tx, {
+    memo: `Void credit sale receipt #${sale.receiptNo}`,
+    sourceType: "SaleVoid",
+    sourceId: sale.id,
+    lines,
+  });
+}
+
 export async function postRefundJournal(
   tx: Tx,
   refund: {
@@ -188,6 +226,48 @@ export async function postRefundJournal(
     sourceType: "Refund",
     sourceId: refund.id,
     lines,
+  });
+}
+
+export async function postCustomerPaymentJournal(
+  tx: Tx,
+  payment: {
+    id: string;
+    receiptNo: number;
+    amount: number;
+    method: string;
+    customerName: string;
+    isWriteOff?: boolean;
+  }
+) {
+  if (payment.amount <= 0) return null;
+  if (payment.isWriteOff) {
+    return postJournal(tx, {
+      memo: `Write-off #${payment.receiptNo} — ${payment.customerName}`,
+      sourceType: "CustomerPayment",
+      sourceId: payment.id,
+      lines: [
+        { code: CODES.BAD_DEBT, debit: payment.amount },
+        { code: CODES.AR, credit: payment.amount },
+      ],
+    });
+  }
+  const cashCode =
+    payment.method === "MPESA"
+      ? CODES.MPESA
+      : payment.method === "CARD"
+        ? CODES.CARD
+        : payment.method === "BANK"
+          ? CODES.BANK
+          : CODES.CASH;
+  return postJournal(tx, {
+    memo: `Customer payment #${payment.receiptNo} — ${payment.customerName}`,
+    sourceType: "CustomerPayment",
+    sourceId: payment.id,
+    lines: [
+      { code: cashCode, debit: payment.amount },
+      { code: CODES.AR, credit: payment.amount },
+    ],
   });
 }
 

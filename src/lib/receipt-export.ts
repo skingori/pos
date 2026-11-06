@@ -1,8 +1,24 @@
 import { formatKes } from "@/lib/money";
 import type { ThermalReceiptData } from "@/components/thermal-receipt";
+import { buildAccountSlipLines, paymentMethodLabel } from "@/lib/receipt-account";
 
 function escapePdf(text: string) {
   return text.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function wrapPdfLine(text: string, width = 32): string[] {
+  const raw = String(text || "");
+  if (!raw) return [""];
+  const out: string[] = [];
+  let rest = raw;
+  while (rest.length > width) {
+    let cut = rest.lastIndexOf(" ", width);
+    if (cut < Math.floor(width * 0.4)) cut = width;
+    out.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest) out.push(rest);
+  return out;
 }
 
 function receiptLines(data: ThermalReceiptData & { docType?: "receipt" | "bill" }) {
@@ -20,46 +36,63 @@ function receiptLines(data: ThermalReceiptData & { docType?: "receipt" | "bill" 
   if (data.customer?.name) out.push(`Customer: ${data.customer.name}`);
   out.push("--------------------------------");
   for (const l of data.lines) {
-    out.push(l.name);
-    out.push(`  ${l.qty} ${l.unit} x ${formatKes(l.unitPrice)} = ${formatKes(l.lineTotal)}`);
+    out.push(...wrapPdfLine(l.name));
+    out.push(
+      ...wrapPdfLine(`  ${l.qty} ${l.unit} x ${formatKes(l.unitPrice)} = ${formatKes(l.lineTotal)}`)
+    );
   }
   out.push("--------------------------------");
   if (typeof data.subtotal === "number") out.push(`Subtotal: ${formatKes(data.subtotal)}`);
   if ((data.discount || 0) > 0) out.push(`Discount: -${formatKes(data.discount || 0)}`);
-  if ((data.taxAmount || 0) > 0) out.push(`VAT ${data.taxRate}%: ${formatKes(data.taxAmount || 0)}`);
-  out.push(`TOTAL: ${formatKes(data.total)}`);
-  if (!isBill && data.payments?.length) {
-    out.push("--------------------------------");
-    for (const p of data.payments) {
-      out.push(
-        `${p.method}${p.mpesaReceipt ? ` ${p.mpesaReceipt}` : ""}: ${formatKes(p.amount)}`
-      );
-    }
+  if ((data.taxAmount || 0) > 0) {
+    out.push(`VAT ${data.taxRate}% (incl.): ${formatKes(data.taxAmount || 0)}`);
   }
-  const creditAmt = (data.payments || [])
-    .filter((p) => p.method === "CREDIT")
-    .reduce((s, p) => s + Number(p.amount || 0), 0);
+  out.push(`TOTAL: ${formatKes(data.total)}`);
+
   const prevBal =
     data.creditBalanceBefore != null && Number.isFinite(data.creditBalanceBefore)
       ? Number(data.creditBalanceBefore)
       : null;
-  if (creditAmt > 0.009 || (isBill && prevBal != null && prevBal > 0.009)) {
+  const accountLines = buildAccountSlipLines({
+    prevBal,
+    payments: data.payments || [],
+    isBill,
+  });
+  const collectLines = (data.payments || []).filter((p) => p.method !== "CREDIT");
+  const showCollect =
+    isBill &&
+    collectLines.length > 0 &&
+    !accountLines?.some(
+      (l) => l.label === "Amount due" || l.label === "Deposit toward bill"
+    );
+
+  if (!isBill && data.payments?.length) {
     out.push("--------------------------------");
-    out.push("Account");
-    if (prevBal != null) out.push(`Previous balance: ${formatKes(prevBal)}`);
-    if (creditAmt > 0.009) {
-      out.push(`${isBill ? "This bill (credit)" : "This credit"}: ${formatKes(creditAmt)}`);
-    }
-    if (prevBal != null) {
+    out.push("Paid");
+    for (const p of data.payments) {
       out.push(
-        `${isBill ? "Balance if on credit" : "New balance"}: ${formatKes(prevBal + creditAmt)}`
+        `${paymentMethodLabel(p.method)}${p.mpesaReceipt ? ` ${p.mpesaReceipt}` : ""}: ${formatKes(p.amount)}`
       );
     }
+  } else if (showCollect) {
+    out.push("--------------------------------");
+    out.push("Amount due");
+    for (const p of collectLines) {
+      out.push(`${paymentMethodLabel(p.method)}: ${formatKes(p.amount)}`);
+    }
   }
+
+  if (accountLines?.length) {
+    out.push("--------------------------------");
+    out.push("Account");
+    for (const line of accountLines) {
+      out.push(`${line.label}: ${line.value}`);
+    }
+  }
+
   if (isBill) {
     out.push("--------------------------------");
-    out.push("This is a bill / estimate only.");
-    out.push("Payment not yet received.");
+    out.push("Estimate only. Pay at the till to complete.");
   } else if (data.receiptFooter) {
     out.push("--------------------------------");
     out.push(data.receiptFooter);
@@ -92,17 +125,17 @@ export function downloadReceiptPdf(
   data: ThermalReceiptData & { docType?: "receipt" | "bill" },
   filename?: string
 ) {
-  const lines = receiptLines(data);
-  const fontSize = 10;
-  const leading = 13;
-  const marginX = 36;
-  const pageWidth = 226; // ~80mm
-  const pageHeight = Math.max(400, 60 + lines.length * leading);
-  const startY = pageHeight - 36;
+  const lines = receiptLines(data).flatMap((line) => wrapPdfLine(line));
+  const fontSize = 9;
+  const leading = 11;
+  const marginX = 14;
+  const pageWidth = 226; // ~80mm at 72dpi
+  const pageHeight = Math.max(300, 36 + lines.length * leading);
+  const startY = pageHeight - 16;
 
   const content: string[] = ["BT", `/F1 ${fontSize} Tf`, `${marginX} ${startY} Td`, `${leading} TL`];
   lines.forEach((line, i) => {
-    const safe = escapePdf(line.slice(0, 64));
+    const safe = escapePdf(line);
     if (i === 0) content.push(`(${safe}) Tj`);
     else content.push(`T* (${safe}) Tj`);
   });

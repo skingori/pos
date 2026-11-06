@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { clampUnitPrice } from "@/lib/money";
 
 const DECIMAL_UNITS = new Set([
   "kg",
@@ -35,6 +36,65 @@ export function allowsDecimal(unit: string) {
 /** Preferred +/- step for weight/volume units (half kg / half litre). */
 export function decimalStep(unit: string) {
   return allowsDecimal(unit) ? 0.5 : 1;
+}
+
+function sanitizePriceDraft(raw: string) {
+  let v = raw.replace(/[^\d.]/g, "");
+  const dot = v.indexOf(".");
+  if (dot !== -1) {
+    v = v.slice(0, dot + 1) + v.slice(dot + 1).replace(/\./g, "");
+  }
+  const [intPart = "", decPart] = v.split(".");
+  const int = intPart.slice(0, 8);
+  if (decPart == null && !v.includes(".")) return int;
+  return `${int}.${decPart.slice(0, 2)}`;
+}
+
+/** Compact unit-price field matched to the qty stepper height. */
+export function CartPriceInput({
+  value,
+  onChange,
+  label,
+}: {
+  value: number;
+  onChange: (price: number) => void;
+  label?: string;
+}) {
+  const [draft, setDraft] = useState(String(value));
+
+  useEffect(() => setDraft(String(value)), [value]);
+
+  function commit() {
+    const n = Number(draft);
+    if (!Number.isFinite(n) || n < 0) {
+      setDraft(String(value));
+      return;
+    }
+    const next = clampUnitPrice(n);
+    setDraft(String(next));
+    if (next !== value) onChange(next);
+  }
+
+  return (
+    <div className="sf-cart-price" title="Unit price">
+      <span>KSh</span>
+      <input
+        inputMode="decimal"
+        aria-label={label || "Unit price"}
+        value={draft}
+        onFocus={(e) => e.target.select()}
+        onChange={(e) => setDraft(sanitizePriceDraft(e.target.value))}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          if (e.key === "Escape") {
+            setDraft(String(value));
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </div>
+  );
 }
 
 export function QtyStepper({
@@ -75,90 +135,90 @@ export function QtyStepper({
 
   const over = Number(draft) > max;
 
+  if (compact) {
+    return (
+      <div className={`sf-qty-compact ${over ? "is-over" : ""}`} title={`${unit} · ${max} left`}>
+        <button
+          type="button"
+          aria-label="Decrease quantity"
+          disabled={value <= 0.01}
+          onClick={() => onChange(clamp(value - step))}
+        >
+          −
+        </button>
+        <input
+          inputMode={decimal ? "decimal" : "numeric"}
+          aria-label="Quantity"
+          value={draft}
+          onFocus={(e) => e.target.select()}
+          onChange={(e) => setDraft(e.target.value.replace(decimal ? /[^\d.]/g : /\D/g, ""))}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            if (e.key === "Escape") {
+              setDraft(String(value));
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+        />
+        <button
+          type="button"
+          aria-label="Increase quantity"
+          disabled={value >= max}
+          onClick={() => onChange(clamp(value + step))}
+        >
+          +
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="flex items-center gap-1.5">
-      {compact ? (
-        <div className={`sf-qty-compact ${over ? "is-over" : ""}`} title={`${unit} · ${max} left`}>
-          <button
-            type="button"
-            aria-label="Decrease quantity"
-            disabled={value <= 0.01}
-            onClick={() => onChange(clamp(value - step))}
-          >
-            −
-          </button>
-          <input
-            inputMode={decimal ? "decimal" : "numeric"}
-            aria-label="Quantity"
-            value={draft}
-            onFocus={(e) => e.target.select()}
-            onChange={(e) => setDraft(e.target.value.replace(decimal ? /[^\d.]/g : /\D/g, ""))}
-            onBlur={commit}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-              if (e.key === "Escape") {
-                setDraft(String(value));
-                (e.target as HTMLInputElement).blur();
-              }
-            }}
-          />
-          <button
-            type="button"
-            aria-label="Increase quantity"
-            disabled={value >= max}
-            onClick={() => onChange(clamp(value + step))}
-          >
-            +
-          </button>
-        </div>
-      ) : (
-        <>
-          <div className={`sf-qty ${over ? "border-rose-400" : ""}`}>
-            <button
-              type="button"
-              aria-label="Decrease quantity"
-              disabled={value <= min}
-              onClick={() => onChange(clamp(value - step))}
-            >
-              -
-            </button>
-            <input
-              inputMode={decimal ? "decimal" : "numeric"}
-              aria-label="Quantity"
-              value={draft}
-              onFocus={(e) => e.target.select()}
-              onChange={(e) => setDraft(e.target.value.replace(decimal ? /[^\d.]/g : /\D/g, ""))}
-              onBlur={commit}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                if (e.key === "Escape") {
-                  setDraft(String(value));
-                  (e.target as HTMLInputElement).blur();
-                }
-                if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  onChange(clamp(value + step));
-                }
-                if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  onChange(clamp(value - step));
-                }
-              }}
-            />
-            <button
-              type="button"
-              aria-label="Increase quantity"
-              disabled={value >= max}
-              onClick={() => onChange(clamp(value + step))}
-            >
-              +
-            </button>
-          </div>
-          <span className={`text-[11px] ${over ? "font-medium text-rose-600" : "text-slate-400"}`}>
-            {over ? `Only ${max} in stock` : `${unit} · ${max} left`}
-          </span>
-        </>
-      )}
+      <div className={`sf-qty ${over ? "border-rose-400" : ""}`}>
+        <button
+          type="button"
+          aria-label="Decrease quantity"
+          disabled={value <= min}
+          onClick={() => onChange(clamp(value - step))}
+        >
+          -
+        </button>
+        <input
+          inputMode={decimal ? "decimal" : "numeric"}
+          aria-label="Quantity"
+          value={draft}
+          onFocus={(e) => e.target.select()}
+          onChange={(e) => setDraft(e.target.value.replace(decimal ? /[^\d.]/g : /\D/g, ""))}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            if (e.key === "Escape") {
+              setDraft(String(value));
+              (e.target as HTMLInputElement).blur();
+            }
+            if (e.key === "ArrowUp") {
+              e.preventDefault();
+              onChange(clamp(value + step));
+            }
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              onChange(clamp(value - step));
+            }
+          }}
+        />
+        <button
+          type="button"
+          aria-label="Increase quantity"
+          disabled={value >= max}
+          onClick={() => onChange(clamp(value + step))}
+        >
+          +
+        </button>
+      </div>
+      <span className={`text-[11px] ${over ? "font-medium text-rose-600" : "text-slate-400"}`}>
+        {over ? `Only ${max} in stock` : `${unit} · ${max} left`}
+      </span>
     </div>
   );
 }

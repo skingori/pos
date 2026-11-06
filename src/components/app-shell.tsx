@@ -1,38 +1,68 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Sidebar } from "./sidebar";
 import { TopBar } from "./top-bar";
 
+export type CashSessionInfo = {
+  branchName: string;
+  openedAtLabel: string;
+  openedBy: string;
+  openingFloat: number;
+};
+
 export function AppShell({
   children,
-  sessionLabel,
   tillOpen,
+  cashSession,
 }: {
   children: React.ReactNode;
-  sessionLabel?: string;
   activeBranch?: { id: string; name: string; code: string };
   tillOpen?: boolean;
+  cashSession?: CashSessionInfo | null;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setMobileOpen(false);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  function toggleNav() {
+    if (typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches) {
+      setCollapsed((c) => !c);
+      setMobileOpen(false);
+    } else {
+      setMobileOpen((o) => !o);
+    }
+  }
+
   return (
-    <div className="flex min-h-screen text-[var(--sf-text)]">
+    <div className="min-h-screen bg-[var(--sf-bg)] text-[var(--sf-text)] antialiased [font-variant-numeric:tabular-nums]">
       <Sidebar
         open={mobileOpen}
-        onClose={() => setMobileOpen(false)}
         collapsed={collapsed}
+        onClose={() => setMobileOpen(false)}
+        tillOpen={tillOpen}
+        cashSession={cashSession}
       />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div
+        className={`transition-[padding] duration-200 ${
+          collapsed ? "lg:pl-0" : "lg:pl-[17rem]"
+        }`}
+      >
         <TopBar
-          sessionLabel={sessionLabel}
           tillOpen={tillOpen}
-          onMenuClick={() => setMobileOpen(true)}
-          onToggleCollapse={() => setCollapsed((c) => !c)}
-          collapsed={collapsed}
+          cashSession={cashSession}
+          onToggleNav={toggleNav}
         />
-        <main className="sf-enter flex-1 p-4 md:p-6 lg:p-7">{children}</main>
+        <main className="sf-enter mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-6">
+          {children}
+        </main>
       </div>
     </div>
   );

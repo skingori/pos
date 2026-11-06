@@ -72,8 +72,9 @@ export async function POST(req: NextRequest) {
   if (!Number.isFinite(cost) || cost < 0) {
     return NextResponse.json({ error: "Buying price is required" }, { status: 400 });
   }
-  if (!Number.isFinite(Number(body.sellPrice)) || Number(body.sellPrice) <= 0) {
-    return NextResponse.json({ error: "Sell price is required" }, { status: 400 });
+  const sellPrice = Number(body.sellPrice ?? 0);
+  if (!Number.isFinite(sellPrice) || sellPrice < 0) {
+    return NextResponse.json({ error: "Sell price cannot be negative" }, { status: 400 });
   }
 
   const product = await prisma.$transaction(async (tx) => {
@@ -84,7 +85,7 @@ export async function POST(req: NextRequest) {
         barcode: body.barcode || null,
         categoryId: body.categoryId || null,
         cost,
-        sellPrice: Number(body.sellPrice),
+        sellPrice,
         unit: body.unit || "pc",
         imageUrl: body.imageUrl || null,
         trackSerial: Boolean(body.trackSerial),

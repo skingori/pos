@@ -32,17 +32,17 @@ export async function receiveSerials(
   }
 }
 
-export async function sellSerials(
+export async function assertSellableSerials(
   tx: Tx,
   productId: string,
   serials: string[],
-  saleId: string,
   branchId?: string | null
 ) {
   const product = await tx.product.findUnique({ where: { id: productId } });
-  if (!product?.trackSerial) return;
+  if (!product?.trackSerial) return [];
   const list = uniq(serials);
   if (list.length === 0) throw new Error(`Serials required for ${product.name}`);
+  const units = [];
   for (const serial of list) {
     const unit = await tx.serialUnit.findUnique({
       where: { productId_serial: { productId, serial } },
@@ -53,6 +53,20 @@ export async function sellSerials(
     if (branchId && unit.branchId && unit.branchId !== branchId) {
       throw new Error(`Serial ${serial} is not at this branch`);
     }
+    units.push(unit);
+  }
+  return units;
+}
+
+export async function sellSerials(
+  tx: Tx,
+  productId: string,
+  serials: string[],
+  saleId: string,
+  branchId?: string | null
+) {
+  const units = await assertSellableSerials(tx, productId, serials, branchId);
+  for (const unit of units) {
     await tx.serialUnit.update({
       where: { id: unit.id },
       data: { status: "SOLD", saleId, branchId: null },

@@ -22,15 +22,20 @@ export default async function DashboardLayout({
     orderBy: { createdAt: "desc" },
   });
 
-  const sessionLabel = open
-    ? `${branch.name} OPEN since ${format(open.createdAt, "MMM d")} by ${open.openedBy.name} · opening ${open.openingFloat.toFixed(2)}`
-    : `${branch.name} — no open session (open the day from Cash)`;
-
   return (
     <AppShell
-      sessionLabel={sessionLabel}
       activeBranch={{ id: branch.id, name: branch.name, code: branch.code }}
       tillOpen={Boolean(open)}
+      cashSession={
+        open
+          ? {
+              branchName: branch.name,
+              openedAtLabel: format(open.createdAt, "d MMM"),
+              openedBy: open.openedBy.name,
+              openingFloat: open.openingFloat,
+            }
+          : null
+      }
     >
       {children}
     </AppShell>
