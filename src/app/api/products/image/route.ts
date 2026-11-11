@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { saveProductImage } from "@/lib/product-image";
 
 export const runtime = "nodejs";
@@ -8,7 +8,7 @@ export const runtime = "nodejs";
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "inventory.manage")) return forbidden();
 
   const form = await req.formData();
   const file = form.get("file");

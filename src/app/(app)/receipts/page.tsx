@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { Role } from "@prisma/client";
-import { formatKes } from "@/lib/money";
+import { formatKes, formatMoneyParts } from "@/lib/money";
 import { toCsv } from "@/lib/csv";
-import { canApproveRefund } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { ThermalReceipt } from "@/components/thermal-receipt";
 import { A4TaxInvoice } from "@/components/a4-tax-invoice";
 import { printA4Invoice, printThermalReceipt } from "@/lib/print-thermal";
@@ -84,6 +85,24 @@ type DatePreset =
 type QuickFilter = "all" | "MPESA" | "CASH" | "CREDIT" | "partial";
 
 const ALL_TIME_TAKE = 2000;
+
+function formatSaleStatus(status: string) {
+  const labels: Record<string, string> = {
+    COMPLETED: "Completed",
+    PENDING: "Pending",
+    CANCELLED: "Voided",
+    VOIDED: "Voided",
+    REFUNDED: "Refunded",
+    PARTIALLY_REFUNDED: "Partially refunded",
+  };
+  return (
+    labels[status] ||
+    status
+      .replace(/_/g, " ")
+      .toLowerCase()
+      .replace(/^\w/, (c) => c.toUpperCase())
+  );
+}
 
 function ymd(d: Date) {
   const y = d.getFullYear();
@@ -179,16 +198,20 @@ function paymentRef(s: Sale) {
   return s.cashier.name;
 }
 
-function formatMoneyParts(n: number) {
-  const [whole, frac] = Math.abs(n).toFixed(2).split(".");
-  const withCommas = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return { whole: `${n < 0 ? "-" : ""}${withCommas}`, frac };
+export default function ReceiptsPage() {
+  return (
+    <Suspense fallback={<p className="p-6 text-sm text-slate-500">Loading receipts…</p>}>
+      <ReceiptsInner />
+    </Suspense>
+  );
 }
 
-export default function ReceiptsPage() {
+function ReceiptsInner() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const { data: session } = useSession();
   const canVoid = session?.user?.role
-    ? canApproveRefund(session.user.role as Role)
+    ? hasPermission(session.user, "refunds.approve")
     : false;
   const [sales, setSales] = useState<Sale[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -206,6 +229,8 @@ export default function ReceiptsPage() {
   const [pageSize, setPageSize] = useState(25);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Sale | null>(null);
+  const [focusSaleId, setFocusSaleId] = useState<string | null>(null);
+  const pendingFocus = useRef<{ saleId?: string; q?: string } | null>(null);
   const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
   const [payTarget, setPayTarget] = useState<RecordPaymentTarget | null>(null);
   const [refundTarget, setRefundTarget] = useState<RefundSaleTarget | null>(null);
@@ -332,6 +357,56 @@ export default function ReceiptsPage() {
     setPage(1);
     setCheckedIds(new Set());
   }, [from, to, minAmount, maxAmount, method, statusFilter, q, pageSize, quick]);
+
+  useEffect(() => {
+    const saleId = searchParams.get("saleId");
+    const receiptQ = searchParams.get("q");
+    if (!saleId && !receiptQ) return;
+
+    let cancelled = false;
+    (async () => {
+      // Land in the table (not the preview modal) so Pay / Refund / Void stay available.
+      if (saleId) {
+        const res = await fetch(`/api/sales?id=${encodeURIComponent(saleId)}`);
+        const list = await res.json();
+        const sale = Array.isArray(list) ? list[0] : null;
+        if (!cancelled && sale?.id) {
+          pendingFocus.current = { saleId: sale.id, q: String(sale.receiptNo) };
+          setQ(String(sale.receiptNo));
+          applyPreset("all");
+          setFocusSaleId(sale.id);
+        }
+      } else if (receiptQ) {
+        pendingFocus.current = { q: receiptQ };
+        setQ(receiptQ);
+        applyPreset("all");
+      }
+      if (!cancelled) router.replace("/receipts", { scroll: false });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (loading || !pendingFocus.current) return;
+    const pending = pendingFocus.current;
+    pendingFocus.current = null;
+    const match = sales.find(
+      (s) =>
+        (pending.saleId && s.id === pending.saleId) ||
+        (pending.q && String(s.receiptNo) === pending.q)
+    );
+    if (!match) return;
+    setFocusSaleId(match.id);
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`receipt-row-${match.id}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }, [loading, sales]);
 
   useEffect(() => {
     if (!selected) return;
@@ -599,172 +674,167 @@ export default function ReceiptsPage() {
   const creditParts = formatMoneyParts(receivables.owed);
   const voidedParts = formatMoneyParts(kpis.voidedAmount);
 
+  const ghostBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-50 disabled:opacity-50";
+  const primaryBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50";
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <div className="flex flex-wrap items-center gap-3">
-            <h1 className="sf-display text-2xl font-extrabold tracking-tight text-[var(--sf-brand)] sm:text-3xl">
+      <section
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+        aria-label="Receipts overview"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold tracking-tight text-slate-900 sm:text-lg">
               Receipts & Transactions
             </h1>
-            <span className="rounded-md bg-[var(--sf-accent-soft)] px-2.5 py-0.5 text-xs font-bold text-[var(--sf-accent-deep)]">
-              Live Ledger
-            </span>
-          </div>
-          <p className="mt-1 text-sm text-[var(--sf-muted)]">
-            Sales, M-Pesa reconciliations, and credit receivables for the selected period.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2.5">
-          {checkedIds.size > 0 ? (
-            <div className="flex animate-[fadeIn_0.15s_ease] items-center gap-2">
-              <span className="rounded-lg bg-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-700">
-                {checkedIds.size} selected
+            <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-slate-500">{periodLabel}</span>
+              <span className="rounded-full bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 ring-1 ring-inset ring-indigo-600/20">
+                Live ledger
               </span>
-              <button
-                type="button"
-                onClick={printBatch}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-slate-700"
-              >
-                <svg className="size-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
-                </svg>
-                Print Batch
-              </button>
+              {receivables.debtors > 0 && (
+                <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                  {receivables.debtors} owing
+                </span>
+              )}
+              {kpis.voided > 0 && (
+                <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 ring-1 ring-inset ring-slate-500/20">
+                  {kpis.voided} voided
+                </span>
+              )}
+              {checkedIds.size > 0 && (
+                <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                  {checkedIds.size} selected
+                </span>
+              )}
             </div>
-          ) : null}
-          <button
-            type="button"
-            className="inline-flex items-center gap-2 rounded-xl border border-[var(--sf-border)] bg-white px-4 py-2.5 text-xs font-semibold text-[var(--sf-brand)] shadow-sm hover:bg-[var(--sf-surface-2)]"
-            disabled={!displaySales.length}
-            onClick={exportCsv}
-          >
-            Export CSV
-          </button>
-          <Link
-            href="/pos"
-            className="inline-flex items-center gap-2 rounded-xl bg-[var(--sf-accent)] px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-[var(--sf-accent-deep)]"
-          >
-            Make a Sale
-            <kbd className="rounded bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-white/90">
-              F2
-            </kbd>
-          </Link>
-        </div>
-      </div>
+          </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="rounded-2xl border border-[var(--sf-border)] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-[var(--sf-muted)]">
-              Total Net Sales
-            </span>
-          </div>
-          <p className="mt-2 font-mono text-2xl font-extrabold tracking-tight text-[var(--sf-brand)]">
-            <span className="mr-1 font-sans text-xs font-medium text-slate-400">KSh</span>
-            {netParts.whole}
-            <span className="text-base text-slate-400">.{netParts.frac}</span>
-          </p>
-          <div className="mt-3 flex items-center justify-between text-xs text-[var(--sf-muted)]">
-            <span className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full bg-emerald-500" /> M-Pesa: {kpis.pctMpesa}%
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full bg-slate-500" /> Cash: {kpis.pctCash}%
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full bg-amber-500" /> Credit: {kpis.pctCredit}%
-            </span>
-          </div>
-          <div className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
-            <div className="bg-emerald-500" style={{ width: `${kpis.pctMpesa}%` }} />
-            <div className="bg-slate-500" style={{ width: `${kpis.pctCash}%` }} />
-            <div className="bg-amber-500" style={{ width: `${kpis.pctCredit}%` }} />
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-[var(--sf-border)] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-[var(--sf-muted)]">
-              Transactions Count
-            </span>
-            <span className="grid size-7 place-items-center rounded-lg bg-[var(--sf-accent-soft)] text-[var(--sf-accent-deep)]">
-              <svg className="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-            </span>
-          </div>
-          <p className="mt-2 font-mono text-2xl font-extrabold tracking-tight text-[var(--sf-brand)]">
-            {kpis.count}{" "}
-            <span className="font-sans text-sm font-medium text-[var(--sf-muted)]">Receipts</span>
-          </p>
-          <p className="mt-3 text-xs text-[var(--sf-muted)]">
-            Avg Basket:{" "}
-            <strong className="font-mono text-[var(--sf-brand)]">{formatKes(kpis.avg)}</strong>
-          </p>
-        </div>
-
-        <div className="rounded-2xl border border-[var(--sf-border)] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-[var(--sf-muted)]">
-              Pending Credit
-            </span>
-            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-xs font-bold text-amber-700">
-              {receivables.debtors} Accounts
-            </span>
-          </div>
-          <p className="mt-2 font-mono text-2xl font-extrabold tracking-tight text-amber-600">
-            <span className="mr-1 font-sans text-xs font-medium text-slate-400">KSh</span>
-            {creditParts.whole}
-            <span className="text-base text-amber-400">.{creditParts.frac}</span>
-          </p>
-          <p className="mt-3 flex items-center justify-between text-xs text-[var(--sf-muted)]">
-            <span className="truncate pr-2">
-              {receivables.names.length ? receivables.names.join(" & ") : "No open balances"}
-            </span>
-            <Link href="/receivables" className="shrink-0 font-semibold text-amber-600 hover:underline">
-              Collect →
-            </Link>
-          </p>
-        </div>
-
-        <div className="rounded-2xl border border-[var(--sf-border)] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-[var(--sf-muted)]">
-              Money Voided
-            </span>
-            <span
-              className={`rounded-full border px-2 py-0.5 text-xs font-bold ${
-                kpis.voided > 0
-                  ? "border-slate-300 bg-slate-100 text-slate-700"
-                  : "border-emerald-200 bg-emerald-50 text-emerald-700"
-              }`}
-            >
-              {kpis.voided} {kpis.voided === 1 ? "receipt" : "receipts"}
-            </span>
-          </div>
-          <p className="mt-2 font-mono text-2xl font-extrabold tracking-tight text-[var(--sf-brand)]">
-            <span className="mr-1 font-sans text-xs font-medium text-slate-400">KSh</span>
-            {voidedParts.whole}
-            <span className="text-base text-slate-400">.{voidedParts.frac}</span>
-          </p>
-          <p className="mt-3 flex items-center justify-between text-xs text-[var(--sf-muted)]">
-            <span>Credit sales cancelled this period</span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {checkedIds.size > 0 && (
+              <button type="button" onClick={printBatch} className={ghostBtn}>
+                Print batch
+              </button>
+            )}
             <button
               type="button"
-              className="shrink-0 font-semibold text-[var(--sf-accent-deep)] hover:underline disabled:opacity-40"
-              disabled={kpis.voided === 0}
-              onClick={() => {
-                setStatusFilter("CANCELLED");
-                setQuick("all");
-                setMethod("");
-              }}
+              className={ghostBtn}
+              disabled={!displaySales.length}
+              onClick={exportCsv}
             >
-              Show voided →
+              Export CSV
             </button>
-          </p>
+            <Link href="/pos" className={primaryBtn}>
+              Make a sale
+              <kbd className="rounded bg-black/20 px-1 py-0.5 font-mono text-[10px] text-white/90">
+                F2
+              </kbd>
+            </Link>
+          </div>
         </div>
-      </div>
+
+        <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-4 lg:divide-y-0">
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Net sales
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {netParts.whole}
+                <span className="text-sm text-slate-400">.{netParts.frac}</span>
+              </span>
+            </div>
+            <div className="mt-1.5 flex h-1 w-full overflow-hidden rounded-full bg-slate-100">
+              <div className="bg-emerald-500" style={{ width: `${kpis.pctMpesa}%` }} />
+              <div className="bg-slate-500" style={{ width: `${kpis.pctCash}%` }} />
+              <div className="bg-amber-500" style={{ width: `${kpis.pctCredit}%` }} />
+            </div>
+            <p className="mt-1 text-[10px] text-slate-500">
+              M-Pesa {kpis.pctMpesa}% · Cash {kpis.pctCash}% · Credit {kpis.pctCredit}%
+            </p>
+          </div>
+
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Transactions
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {kpis.count}
+              </span>
+              <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
+                receipts
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Avg basket {formatKes(kpis.avg)}
+            </p>
+          </div>
+
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Pending credit
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-amber-700 sm:text-lg">
+                {creditParts.whole}
+                <span className="text-sm text-amber-400">.{creditParts.frac}</span>
+              </span>
+              {receivables.debtors > 0 && (
+                <span className="rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-800">
+                  {receivables.debtors} accts
+                </span>
+              )}
+            </div>
+            <p className="mt-1 truncate text-[11px] text-slate-500">
+              {receivables.names.length ? receivables.names.join(" & ") : "No open balances"}
+            </p>
+            <Link
+              href="/customers?filter=owing"
+              className="mt-1.5 self-start text-[11px] font-medium text-indigo-700 hover:underline"
+            >
+              Collect →
+            </Link>
+          </div>
+
+          <button
+            type="button"
+            className="flex flex-col px-3 py-2.5 text-left hover:bg-slate-50 sm:px-4 disabled:cursor-default disabled:hover:bg-transparent"
+            disabled={kpis.voided === 0}
+            onClick={() => {
+              setStatusFilter("CANCELLED");
+              setQuick("all");
+              setMethod("");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Money voided
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {voidedParts.whole}
+                <span className="text-sm text-slate-400">.{voidedParts.frac}</span>
+              </span>
+              <span
+                className={`rounded px-1 py-0.5 text-[10px] font-medium ${
+                  kpis.voided > 0
+                    ? "bg-slate-100 text-slate-700"
+                    : "bg-emerald-50 text-emerald-700"
+                }`}
+              >
+                {kpis.voided} {kpis.voided === 1 ? "receipt" : "receipts"}
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">Cancelled this period</p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              Show voided →
+            </span>
+          </button>
+        </div>
+      </section>
 
       <div className="space-y-4 rounded-2xl border border-[var(--sf-border)] bg-white p-4 shadow-sm sm:p-5">
         <div className="flex flex-col gap-3 border-b border-slate-100 pb-4 lg:flex-row lg:items-center lg:justify-between">
@@ -1023,19 +1093,26 @@ export default function ReceiptsPage() {
               const isRefunded =
                 s.status === "REFUNDED" || s.status === "PARTIALLY_REFUNDED";
               const showVoid = canVoidCredit(s);
+              const focused = focusSaleId === s.id;
               return (
                 <li
+                  id={`receipt-row-${s.id}`}
                   key={s.id}
                   role="button"
                   tabIndex={0}
                   onClick={() => setSelected(s)}
+                  onFocus={() => setFocusSaleId(s.id)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
                       setSelected(s);
                     }
                   }}
-                  className="grid cursor-pointer grid-cols-1 gap-3 px-4 py-4 transition hover:bg-slate-50/80 sm:px-6 lg:grid-cols-12 lg:items-center lg:gap-3"
+                  className={`grid cursor-pointer grid-cols-1 gap-3 px-4 py-4 transition hover:bg-slate-50/80 sm:px-6 lg:grid-cols-12 lg:items-center lg:gap-3 ${
+                    focused
+                      ? "bg-orange-50/80 ring-1 ring-inset ring-orange-200"
+                      : ""
+                  }`}
                 >
                   <div className="flex items-start gap-3 lg:col-span-1">
                     <input
@@ -1098,13 +1175,9 @@ export default function ReceiptsPage() {
                                 : "bg-slate-100 text-slate-700"
                       }`}
                     >
-                      {isVoided
-                        ? "Voided"
-                        : unpaid
-                          ? "Balance due"
-                          : s.status === "COMPLETED"
-                            ? "Completed"
-                            : s.status.replace(/_/g, " ")}
+                      {unpaid && !isVoided
+                        ? "Balance due"
+                        : formatSaleStatus(s.status)}
                     </span>
                   </div>
                   <div className="text-left lg:col-span-2 lg:text-right">
@@ -1124,59 +1197,75 @@ export default function ReceiptsPage() {
                     </p>
                   </div>
                   <div
-                    className="flex items-center justify-start lg:col-span-3 lg:justify-end"
+                    className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-1.5 lg:col-span-3"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    {isVoided ? (
-                      <span className="rounded-xl border border-[var(--sf-border)] bg-slate-50 px-3 py-1.5 text-[11px] font-semibold italic text-slate-400">
-                        Voided
-                      </span>
-                    ) : isRefunded && !unpaid ? (
-                      <span className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-1.5 text-[11px] font-bold text-rose-500">
-                        Refunded
-                      </span>
-                    ) : unpaid ? (
-                      <div className="inline-flex overflow-hidden rounded-xl border border-[var(--sf-border)] bg-white shadow-sm">
-                        <button
-                          type="button"
-                          title="Record Payment"
-                          className={`inline-flex items-center gap-1.5 bg-[var(--sf-brand)] px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 ${
-                            showVoid ? "border-r border-orange-700" : ""
-                          }`}
-                          onClick={() => openPayment(s)}
-                        >
-                          <svg className="size-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
-                          </svg>
-                          Pay
-                        </button>
-                        {showVoid ? (
+                    <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+                      {isVoided ? (
+                        <span className="px-1 text-[11px] font-medium italic text-slate-400">
+                          Voided
+                        </span>
+                      ) : isRefunded && !unpaid ? (
+                        <span className="px-1 text-[11px] font-medium text-rose-500">
+                          Refunded
+                        </span>
+                      ) : unpaid ? (
+                        <>
                           <button
                             type="button"
-                            title="Void Credit"
-                            className="inline-flex items-center gap-1.5 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800 hover:bg-amber-100"
-                            onClick={() => openVoid(s)}
+                            title="Record Payment"
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-800 bg-[var(--sf-brand)] px-2.5 text-xs font-semibold text-white hover:bg-slate-800"
+                            onClick={() => openPayment(s)}
                           >
-                            <svg className="size-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                            <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
                             </svg>
-                            Void Credit
+                            Pay
                           </button>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        title="Refund"
-                        className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white px-3 py-2 text-xs font-bold text-rose-600 shadow-sm hover:bg-rose-50"
-                        onClick={() => openRefund(s)}
-                      >
-                        <svg className="size-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
-                        </svg>
-                        Refund
-                      </button>
-                    )}
+                          {showVoid ? (
+                            <button
+                              type="button"
+                              title="Void Credit"
+                              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+                              onClick={() => openVoid(s)}
+                            >
+                              <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                              </svg>
+                              Void
+                            </button>
+                          ) : null}
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          title="Refund"
+                          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-2.5 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                          onClick={() => openRefund(s)}
+                        >
+                          <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
+                          </svg>
+                          Refund
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      title="Copy items to POS"
+                      className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                      onClick={() => router.push(`/pos?copySale=${encodeURIComponent(s.id)}`)}
+                    >
+                      <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                        />
+                      </svg>
+                      Copy
+                    </button>
                   </div>
                 </li>
               );

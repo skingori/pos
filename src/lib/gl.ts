@@ -1,24 +1,11 @@
 import { prisma } from "./prisma";
 import { roundMoney } from "./money";
 import type { Prisma } from "@prisma/client";
+import { CODES } from "./gl-codes";
+
+export { CODES };
 
 type Tx = Prisma.TransactionClient;
-
-const CODES = {
-  CASH: "1000",
-  MPESA: "1010",
-  CARD: "1020",
-  BANK: "1030",
-  AR: "1100",
-  INVENTORY: "1200",
-  VAT: "2100",
-  EQUITY: "3000",
-  SALES: "4000",
-  COGS: "5000",
-  REFUND_EXP: "5200",
-  WRITE_OFF: "5300",
-  BAD_DEBT: "5400",
-} as const;
 
 export async function ensureChartOfAccounts(tx: Tx = prisma) {
   const accounts: {
@@ -238,6 +225,7 @@ export async function postCustomerPaymentJournal(
     method: string;
     customerName: string;
     isWriteOff?: boolean;
+    isStoreCreditReversal?: boolean;
   }
 ) {
   if (payment.amount <= 0) return null;
@@ -260,6 +248,17 @@ export async function postCustomerPaymentJournal(
         : payment.method === "BANK"
           ? CODES.BANK
           : CODES.CASH;
+  if (payment.isStoreCreditReversal) {
+    return postJournal(tx, {
+      memo: `Store credit reduction #${payment.receiptNo} — ${payment.customerName}`,
+      sourceType: "CustomerPayment",
+      sourceId: payment.id,
+      lines: [
+        { code: CODES.AR, debit: payment.amount },
+        { code: cashCode, credit: payment.amount },
+      ],
+    });
+  }
   return postJournal(tx, {
     memo: `Customer payment #${payment.receiptNo} — ${payment.customerName}`,
     sourceType: "CustomerPayment",
@@ -297,5 +296,3 @@ export async function postCashMovementJournal(
     ],
   });
 }
-
-export { CODES };

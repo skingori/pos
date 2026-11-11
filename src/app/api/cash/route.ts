@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { apiUser, unauthorized } from "@/lib/api-auth";
+import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { roundMoney } from "@/lib/money";
 import { getSessionMoneyTotals } from "@/lib/session-totals";
 import { postCashMovementJournal, postJournal, CODES, ensureChartOfAccounts } from "@/lib/gl";
 import { cookies } from "next/headers";
-import { BRANCH_COOKIE, resolveBranch, resolveBranchId } from "@/lib/branch";
+import { BRANCH_COOKIE, canSwitchBranch, resolveBranch, resolveBranchId } from "@/lib/branch";
+import { parseLeftInDrawer } from "@/lib/cash-ui";
 
 function startOfDay(ymd: string) {
   return new Date(`${ymd}T00:00:00`);
@@ -19,6 +21,7 @@ function endOfDay(ymd: string) {
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "cash.access")) return forbidden();
 
   const { searchParams } = new URL(req.url);
   const detailId = searchParams.get("sessionId");
@@ -56,7 +59,7 @@ export async function GET(req: NextRequest) {
   const activeBranchId = await resolveBranchId(user);
   const activeBranch = await prisma.branch.findUnique({ where: { id: activeBranchId } });
 
-  const canPickBranch = user.role === "ADMIN" || user.role === "MANAGER";
+  const canPickBranch = canSwitchBranch(user);
   const filterBranchId = canPickBranch
     ? searchParams.get("branchId") || activeBranchId
     : activeBranchId;
@@ -152,6 +155,15 @@ export async function GET(req: NextRequest) {
   const filterBranch =
     branches.find((b) => b.id === filterBranchId) || activeBranch;
 
+  const lastClosed = await prisma.posSession.findFirst({
+    where: { status: "CLOSED", branchId: activeBranchId },
+    orderBy: { closedAt: "desc" },
+    select: { note: true, openingFloat: true },
+  });
+  const suggestedOpeningFloat = roundMoney(
+    parseLeftInDrawer(lastClosed?.note) ?? lastClosed?.openingFloat ?? 0
+  );
+
   if (!open) {
     return NextResponse.json({
       open: null,
@@ -161,6 +173,7 @@ export async function GET(req: NextRequest) {
       branches,
       staff,
       openElsewhere,
+      suggestedOpeningFloat,
     });
   }
 
@@ -174,6 +187,7 @@ export async function GET(req: NextRequest) {
     branches,
     staff,
     openElsewhere,
+    suggestedOpeningFloat,
     ...totals,
   });
 }
@@ -181,12 +195,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "cash.access")) return forbidden();
   const body = await req.json();
   const action = body.action as string;
 
   if (action === "open") {
     const branch =
-      body.branchId && (user.role === "ADMIN" || user.role === "MANAGER")
+      body.branchId && canSwitchBranch(user)
         ? await prisma.branch.findFirst({ where: { id: body.branchId, active: true } })
         : await resolveBranch(user);
     if (!branch) {
@@ -234,7 +249,7 @@ export async function POST(req: NextRequest) {
       }
       return s;
     });
-    if (user.role === "ADMIN" || user.role === "MANAGER") {
+    if (canSwitchBranch(user)) {
       const jar = await cookies();
       jar.set(BRANCH_COOKIE, branch.id, {
         path: "/",

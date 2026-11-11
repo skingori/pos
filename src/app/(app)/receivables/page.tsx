@@ -227,24 +227,39 @@ export default function ReceivablesPage() {
     : "—";
 
   return (
-    <div className="mx-auto max-w-6xl space-y-5">
+    <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Receivables</h1>
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            <Link href="/reports?tab=receivables" className="hover:text-slate-600 hover:underline">
+              Reports · AR aging
+            </Link>
+          </p>
+          <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">
+            Aging ledger
+          </h1>
           <p className="mt-1 max-w-2xl text-sm text-slate-500">
-            How old the money owed to you is, customer by customer. Revenue counts when you sell;
-            this page counts what is still unpaid.
+            How old unpaid credit is, customer by customer. Collect payments from the customer
+            account or a receipt — this view is for aging and export.
           </p>
         </div>
-        <button
-          type="button"
-          className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-40"
-          disabled={!customers.length}
-          onClick={exportCsv}
-        >
-          <IconDownload className="h-4 w-4" />
-          Export CSV
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            href="/customers?filter=owing"
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+          >
+            Collect
+          </Link>
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-40"
+            disabled={!customers.length}
+            onClick={exportCsv}
+          >
+            <IconDownload className="h-4 w-4" />
+            Export CSV
+          </button>
+        </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

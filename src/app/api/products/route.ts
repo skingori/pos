@@ -2,19 +2,25 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
 import { writeAudit } from "@/lib/audit";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { resolveBranchId } from "@/lib/branch";
 import { getOrCreateStock, stockFields } from "@/lib/branch-stock";
 
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "inventory.view") && !hasPermission(user, "pos.access")) {
+    return forbidden();
+  }
 
+  const canSeeCost = hasPermission(user, "inventory.manage");
   const branchId = await resolveBranchId(user);
   const { searchParams } = req.nextUrl;
   const q = searchParams.get("q")?.trim();
   const categoryId = searchParams.get("categoryId");
   const belowReorder = searchParams.get("belowReorder") === "1";
+  const outOfStockOnly = searchParams.get("outOfStock") === "1";
+  const stockAlerts = searchParams.get("stockAlerts") === "1";
 
   const products = await prisma.product.findMany({
     where: {
@@ -50,13 +56,26 @@ export async function GET(req: NextRequest) {
       sellPrice: r.sellPrice,
       qty: stockFields(r.stocks[0]).qty,
     }));
-    const { stocks: _s, returnSkus: _r, ...rest } = p;
-    return { ...rest, ...stock, returnSkus, branchId };
+    const { stocks: _s, returnSkus: _r, cost, ...rest } = p;
+    return {
+      ...rest,
+      ...(canSeeCost ? { cost } : {}),
+      ...stock,
+      returnSkus,
+      branchId,
+    };
   });
 
-  const filtered = belowReorder
-    ? mapped.filter((p) => p.qty <= p.reorderLevel)
-    : mapped;
+  if (stockAlerts) {
+    const sellable = mapped.filter((p) => !p.isReturnSku);
+    const outOfStock = sellable.filter((p) => p.qty <= 0).length;
+    const lowStock = sellable.filter((p) => p.qty > 0 && p.qty <= p.reorderLevel).length;
+    return NextResponse.json({ outOfStock, lowStock });
+  }
+
+  let filtered = mapped;
+  if (outOfStockOnly) filtered = mapped.filter((p) => p.qty <= 0 && !p.isReturnSku);
+  else if (belowReorder) filtered = mapped.filter((p) => p.qty <= p.reorderLevel);
 
   return NextResponse.json(filtered);
 }
@@ -64,7 +83,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "inventory.manage")) return forbidden();
 
   const branchId = await resolveBranchId(user);
   const body = await req.json();

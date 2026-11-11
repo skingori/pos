@@ -14,7 +14,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canSwitchBranch(user.role)) return forbidden();
+  if (!canSwitchBranch(user)) return forbidden();
 
   const body = await req.json();
   const branchId = String(body.branchId || "");

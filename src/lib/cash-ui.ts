@@ -1,16 +1,3 @@
-export type CashTab = "open" | "close" | "sessions" | "recon";
-
-export const CASH_TABS: {
-  id: CashTab;
-  href: string;
-  label: string;
-}[] = [
-  { id: "open", href: "/cash/open-day", label: "Open day" },
-  { id: "close", href: "/cash/close-day", label: "Close day" },
-  { id: "sessions", href: "/cash/drawer-sessions", label: "Drawer sessions" },
-  { id: "recon", href: "/cash/reconciliation", label: "Reconciliation" },
-];
-
 export type BranchRef = { id: string; name: string; code: string };
 export type StaffRef = { id: string; name: string; email?: string };
 
@@ -61,6 +48,7 @@ export type CashData = {
   branches?: BranchRef[];
   staff?: StaffRef[];
   sessions?: SessionRow[];
+  suggestedOpeningFloat?: number;
   openElsewhere?: {
     id: string;
     createdAt: string;
@@ -89,7 +77,15 @@ export function formatSessionWhen(iso: string) {
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
-    second: "2-digit",
     hour12: true,
   });
+}
+
+/** Parses "Leave KSh X in drawer" written on close. */
+export function parseLeftInDrawer(note: string | null | undefined): number | null {
+  if (!note) return null;
+  const m = note.match(/Leave KSh\s*([\d,]+(?:\.\d+)?)\s*in drawer/i);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
 }

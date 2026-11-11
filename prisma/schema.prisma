@@ -136,26 +136,73 @@ model Promotion {
 }
 
 model User {
-  id                 String          @id @default(cuid())
+  id                 String           @id @default(cuid())
   name               String
-  email              String          @unique
+  email              String           @unique
   passwordHash       String
-  role               Role            @default(ATTENDANT)
-  active             Boolean         @default(true)
-  mustChangePassword Boolean         @default(false)
+  role               Role             @default(ATTENDANT)
+  groupId            String?
+  group              AccessGroup?     @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  active             Boolean          @default(true)
+  mustChangePassword Boolean          @default(false)
   branchId           String?
-  branch             Branch?         @relation(fields: [branchId], references: [id])
-  createdAt          DateTime        @default(now())
+  branch             Branch?          @relation(fields: [branchId], references: [id])
+  createdAt          DateTime         @default(now())
   sales              Sale[]
-  sessions           PosSession[]  @relation("PosSessionOpenedBy")
-  sessionsClosed     PosSession[]  @relation("PosSessionClosedBy")
+  sessions           PosSession[]     @relation("PosSessionOpenedBy")
+  sessionsClosed     PosSession[]     @relation("PosSessionClosedBy")
   cashMoves          CashMovement[]
-  refundsReq         RefundRequest[] @relation("RefundRequester")
-  refundsRev         RefundRequest[] @relation("RefundReviewer")
+  refundsReq         RefundRequest[]  @relation("RefundRequester")
+  refundsRev         RefundRequest[]  @relation("RefundReviewer")
   auditLogs          AuditLog[]
   purchases          Purchase[]
   customerPayments   CustomerPayment[]
   heldSales          HeldSale[]
+  permissions        UserPermission[]
+}
+
+model AccessGroup {
+  id          String                  @id @default(cuid())
+  name        String
+  code        String                  @unique
+  description String?
+  isSystem    Boolean                 @default(false)
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  permissions AccessGroupPermission[]
+  users       User[]
+}
+
+model AccessGroupPermission {
+  id         String      @id @default(cuid())
+  groupId    String
+  group      AccessGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  permission String
+  createdAt  DateTime    @default(now())
+
+  @@unique([groupId, permission])
+  @@index([groupId])
+}
+
+model RolePermission {
+  id         String   @id @default(cuid())
+  role       Role
+  permission String
+  createdAt  DateTime @default(now())
+
+  @@unique([role, permission])
+  @@index([role])
+}
+
+model UserPermission {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission String
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, permission])
+  @@index([userId])
 }
 
 model Category {
@@ -472,6 +519,8 @@ model CustomerPayment {
   method     PaymentMethod @default(CASH)
   note       String?
   isWriteOff Boolean       @default(false)
+  /// Reduces prepaid store credit (balance moves toward zero / debt), without applying to open receipts.
+  isStoreCreditReversal Boolean @default(false)
   userId     String?
   user       User?         @relation(fields: [userId], references: [id])
   createdAt  DateTime      @default(now())

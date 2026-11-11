@@ -6,7 +6,7 @@ export async function getShopSettings() {
     update: {},
     create: {
       id: "default",
-      shopName: process.env.SHOP_NAME || "Kenya Hardware",
+      shopName: process.env.SHOP_NAME || "Shop",
       defaultMarkupPercent: 25,
       vatPercent: 16,
       pricesIncludeVat: true,

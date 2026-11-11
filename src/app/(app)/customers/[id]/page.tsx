@@ -1,15 +1,16 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { formatKes } from "@/lib/money";
 import { toCsv } from "@/lib/csv";
-import { canSellCredit } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { Role } from "@prisma/client";
 import { PaymentReceipt, type PaymentReceiptData } from "@/components/payment-receipt";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 type Customer = {
   id: string;
@@ -93,15 +94,6 @@ function IconUserOff({ className = "h-4 w-4" }: { className?: string }) {
   );
 }
 
-function IconEdit({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
-    </svg>
-  );
-}
-
 function IconBan({ className = "h-4 w-4" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -161,7 +153,7 @@ function TablePager({
   const start = Math.min(Math.max(0, page - 2), Math.max(0, pageCount - max));
   const buttons = Array.from({ length: max }, (_, i) => start + i);
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-sm text-slate-500 sm:px-5">
+    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-3 py-2 text-xs text-slate-500 sm:px-4">
       <span>
         Showing {from} to {to} of {total} {noun}
       </span>
@@ -240,6 +232,8 @@ function typeBadge(type: string) {
       return "bg-amber-100 text-amber-900 ring-amber-600/20";
     case "CREDIT_REFUND":
       return "bg-violet-100 text-violet-800 ring-violet-600/20";
+    case "STORE_CREDIT_REVERSAL":
+      return "bg-orange-100 text-orange-900 ring-orange-600/20";
     default:
       return "bg-slate-100 text-slate-600 ring-slate-500/20";
   }
@@ -426,15 +420,29 @@ function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
 
+function receiptHrefFromLedger(e: LedgerEntry): string | null {
+  if (e.type === "CREDIT_SALE" && e.id.startsWith("sale-")) {
+    return `/receipts?saleId=${encodeURIComponent(e.id.slice(5))}`;
+  }
+  if (e.type === "CREDIT_REFUND") {
+    const m = e.ref.match(/#(\d+)/);
+    if (m) return `/receipts?q=${encodeURIComponent(m[1])}`;
+  }
+  return null;
+}
+
 export default function CustomerDetailPage() {
   const params = useParams();
+  const router = useRouter();
   const id = String(params.id || "");
   const { data: session } = useSession();
-  const canPay = session?.user?.role && canSellCredit(session.user.role as Role);
-
+  const canPay = hasPermission(session?.user, "customers.access");
+  const canWriteOff = hasPermission(session?.user, "receivables.write_off");
   const [detail, setDetail] = useState<Detail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [confirmToggle, setConfirmToggle] = useState(false);
+  const [toggleBusy, setToggleBusy] = useState(false);
   const [tab, setTab] = useState<Tab>("statement");
   const [ledgerFilter, setLedgerFilter] = useState<"ALL" | "CHARGED" | "RECEIVED">("ALL");
   const [ledgerQ, setLedgerQ] = useState("");
@@ -454,11 +462,8 @@ export default function CustomerDetailPage() {
   const [payMethodFilter, setPayMethodFilter] = useState<"ALL" | "CASH" | "MPESA" | "BANK">("ALL");
   const [payPage, setPayPage] = useState(0);
   const [settings, setSettings] = useState<ShopSettings | null>(null);
-  const [levels, setLevels] = useState<{ id: string; name: string; discountPercent: number }[]>([]);
-
   const [showPay, setShowPay] = useState(false);
   const [showWriteOff, setShowWriteOff] = useState(false);
-  const [showEdit, setShowEdit] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
 
@@ -466,26 +471,20 @@ export default function CustomerDetailPage() {
   const [payMethod, setPayMethod] = useState("CASH");
   const [payNote, setPayNote] = useState("");
   const [payRef, setPayRef] = useState("");
+  /** Collect debt (allows overpay → store credit) vs top up store credit only. */
+  const [payIntent, setPayIntent] = useState<"payment" | "credit">("payment");
   /** null = main Record payment (FIFO all). Set = Pay on one open receipt. */
   const [payTargetSaleId, setPayTargetSaleId] = useState<string | null>(null);
   const [writeAmount, setWriteAmount] = useState("");
   const [writeReason, setWriteReason] = useState("");
-  const [editForm, setEditForm] = useState({
-    name: "",
-    phone: "",
-    email: "",
-    creditLimit: "0",
-    priceLevelId: "",
-  });
   const [receipt, setReceipt] = useState<PaymentReceiptData | null>(null);
 
   async function load() {
     setLoading(true);
     setError("");
-    const [res, s, l] = await Promise.all([
+    const [res, s] = await Promise.all([
       fetch(`/api/customers/${id}`),
       fetch("/api/settings").then((r) => r.json()).catch(() => null),
-      fetch("/api/price-levels").then((r) => r.json()).catch(() => []),
     ]);
     const data = await res.json();
     setLoading(false);
@@ -496,7 +495,6 @@ export default function CustomerDetailPage() {
     }
     setDetail(data);
     if (s?.shopName) setSettings(s);
-    setLevels(Array.isArray(l) ? l : []);
     setPayAmount(data.summary.owed > 0 ? String(data.summary.owed) : "");
     setWriteAmount(data.summary.owed > 0 ? String(data.summary.owed) : "");
   }
@@ -548,6 +546,7 @@ export default function CustomerDetailPage() {
   function closePayModal() {
     setShowPay(false);
     setPayTargetSaleId(null);
+    setPayIntent("payment");
     setFormError("");
   }
 
@@ -563,14 +562,26 @@ export default function CustomerDetailPage() {
   function openPayAll() {
     if (!detail) return;
     setFormError("");
+    setPayIntent("payment");
     setPayTargetSaleId(null);
     setPayMethod("CASH");
-    setPayAmount(detail.summary.owed > 0 ? String(detail.summary.owed) : "");
+    setPayAmount(detail.summary.owed > 0.009 ? String(detail.summary.owed) : "");
+    setShowPay(true);
+  }
+
+  function openAddCredit() {
+    if (!detail) return;
+    setFormError("");
+    setPayIntent("credit");
+    setPayTargetSaleId(null);
+    setPayMethod("CASH");
+    setPayAmount("");
     setShowPay(true);
   }
 
   function openPayReceipt(ch: OpenCharge) {
     setFormError("");
+    setPayIntent("payment");
     setPayTargetSaleId(ch.saleId);
     setPayMethod("CASH");
     setPayAmount(String(ch.openAmount));
@@ -585,56 +596,32 @@ export default function CustomerDetailPage() {
     setPayAmount(next);
   }
 
-  function openEdit() {
+  function askToggleActive() {
     if (!detail) return;
-    setEditForm({
-      name: detail.customer.name,
-      phone: detail.customer.phone || "",
-      email: detail.customer.email || "",
-      creditLimit: String(detail.customer.creditLimit || 0),
-      priceLevelId: detail.customer.priceLevelId || detail.customer.priceLevel?.id || "",
-    });
-    setFormError("");
-    setShowEdit(true);
+    setConfirmToggle(true);
   }
 
-  async function saveEdit(e: React.FormEvent) {
-    e.preventDefault();
-    setFormError("");
-    setSaving(true);
-    const res = await fetch(`/api/customers/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: editForm.name.trim(),
-        phone: editForm.phone || null,
-        email: editForm.email || null,
-        creditLimit: Number(editForm.creditLimit) || 0,
-        priceLevelId: editForm.priceLevelId || null,
-      }),
-    });
-    setSaving(false);
-    const data = await res.json();
-    if (!res.ok) {
-      setFormError(data.error || "Save failed");
-      return;
-    }
-    setShowEdit(false);
-    load();
-  }
-
-  async function toggleActive() {
+  async function runToggleActive() {
     if (!detail) return;
     const next = !detail.customer.active;
-    if (!confirm(next ? `Activate ${detail.customer.name}?` : `Deactivate ${detail.customer.name}?`)) {
-      return;
+    setToggleBusy(true);
+    try {
+      const res = await fetch(`/api/customers/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: next }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setConfirmToggle(false);
+        setError(data.error || "Could not update customer");
+        return;
+      }
+      setConfirmToggle(false);
+      load();
+    } finally {
+      setToggleBusy(false);
     }
-    await fetch(`/api/customers/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ active: next }),
-    });
-    load();
   }
 
   async function submitPayment(e: React.FormEvent, isWriteOff: boolean) {
@@ -700,7 +687,7 @@ export default function CustomerDetailPage() {
       appliedToDebt: data.appliedToDebt,
       excessCredit: data.excessCredit,
       newBalance: data.newBalance,
-      shopName: settings?.shopName || "Kenya Hardware",
+      shopName: settings?.shopName || "Shop",
       address: settings?.address,
       phone: settings?.phone,
       kraPin: settings?.kraPin,
@@ -729,7 +716,7 @@ export default function CustomerDetailPage() {
       appliedToDebt: Math.min(Math.max(0, before), p.amount),
       excessCredit: Math.max(0, p.amount - Math.min(Math.max(0, before), p.amount)),
       newBalance: after,
-      shopName: settings?.shopName || "Kenya Hardware",
+      shopName: settings?.shopName || "Shop",
       address: settings?.address,
       phone: settings?.phone,
       kraPin: settings?.kraPin,
@@ -1037,7 +1024,7 @@ export default function CustomerDetailPage() {
 
   const { customer, summary } = detail;
   const ghostBtn =
-    "inline-flex h-10 items-center gap-2 rounded-lg bg-white px-3.5 text-sm font-medium text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-50";
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-50";
 
   function exportStatement(format: "csv" | "print") {
     if (format === "print") {
@@ -1064,36 +1051,36 @@ export default function CustomerDetailPage() {
     setShowDownload(false);
   }
 
-  const ceiling = Math.max(summary.creditLimit, accountStats.peakBalance, 1);
-
   return (
-    <div className="mx-auto max-w-6xl space-y-6 px-1 py-2 sm:px-0 [font-variant-numeric:tabular-nums]">
+    <div className="space-y-4 px-1 py-1 sm:px-0 [font-variant-numeric:tabular-nums]">
       <section
-        className="overflow-clip rounded-2xl bg-white shadow-sm ring-1 ring-slate-200 print:shadow-none"
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200 print:shadow-none"
         aria-label="Customer overview"
       >
-        <div className="flex flex-wrap items-start justify-between gap-4 p-6">
-          <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
+          <div className="flex min-w-0 items-center gap-2.5">
             <div
-              className={`grid size-14 place-items-center rounded-full text-lg font-semibold ${avatarTone(customer.id)}`}
+              className={`grid size-9 shrink-0 place-items-center rounded-full text-xs font-semibold ${avatarTone(customer.id)}`}
             >
               {initials(customer.name)}
             </div>
-            <div>
-              <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{customer.name}</h1>
-              <div className="mt-1 flex flex-wrap items-center gap-2">
-                <span className="text-sm text-slate-500">{customer.phone || "No phone"}</span>
+            <div className="min-w-0">
+              <h1 className="truncate text-base font-semibold tracking-tight text-slate-900 sm:text-lg">
+                {customer.name}
+              </h1>
+              <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                <span className="text-xs text-slate-500">{customer.phone || "No phone"}</span>
                 {customer.active ? (
-                  <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20">
+                  <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20">
                     Active
                   </span>
                 ) : (
-                  <span className="rounded-full bg-rose-50 px-2.5 py-0.5 text-xs font-medium text-rose-700 ring-1 ring-inset ring-rose-600/20">
+                  <span className="rounded-full bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 ring-1 ring-inset ring-rose-600/20">
                     Inactive
                   </span>
                 )}
                 {summary.owed > 0.009 && (
-                  <span className="rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                  <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
                     Owing
                   </span>
                 )}
@@ -1101,11 +1088,7 @@ export default function CustomerDetailPage() {
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 print:hidden">
-            <button type="button" className={ghostBtn} onClick={openEdit}>
-              <IconEdit className="size-4" />
-              Edit customer
-            </button>
+          <div className="flex flex-wrap items-center gap-1.5 print:hidden">
             <div className="relative">
               <button
                 type="button"
@@ -1117,28 +1100,27 @@ export default function CustomerDetailPage() {
                 }}
               >
                 More
-                <svg className="size-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75">
+                <svg className="size-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75">
                   <path d="M5 8l5 5 5-5" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </button>
               {showMore && (
-                <div className="absolute end-0 z-30 mt-2 w-48 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200">
+                <div className="absolute end-0 z-30 mt-1.5 w-44 overflow-hidden rounded-lg bg-white py-1 shadow-lg ring-1 ring-slate-200">
                   <button
                     type="button"
-                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50"
                     onClick={() => {
                       setShowMore(false);
-                      toggleActive();
+                      askToggleActive();
                     }}
                   >
-                    <IconUserOff className="size-4" />
+                    <IconUserOff className="size-3.5" />
                     {customer.active ? "Deactivate" : "Activate"}
                   </button>
-                  {summary.owed > 0.009 && (
+                  {summary.owed > 0.009 && canWriteOff && (
                     <button
                       type="button"
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                      disabled={!canPay}
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                       onClick={() => {
                         setShowMore(false);
                         setFormError("");
@@ -1146,41 +1128,64 @@ export default function CustomerDetailPage() {
                         setShowWriteOff(true);
                       }}
                     >
-                      <IconBan className="size-4" />
+                      <IconBan className="size-3.5" />
                       Write off
                     </button>
                   )}
                 </div>
               )}
             </div>
-            <button
-              type="button"
-              className="inline-flex h-10 items-center gap-2 rounded-lg bg-indigo-600 px-4 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
-              disabled={!canPay}
-              onClick={openPayAll}
-            >
-              <IconWallet className="size-4" />
-              Record payment
-            </button>
+            {summary.owed > 0.009 ? (
+              <>
+                <button
+                  type="button"
+                  className={ghostBtn}
+                  disabled={!canPay}
+                  onClick={openAddCredit}
+                  title="Deposit prepaid balance on this account"
+                >
+                  Add store credit
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
+                  disabled={!canPay}
+                  onClick={openPayAll}
+                >
+                  <IconWallet className="size-3.5" />
+                  Record payment
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
+                disabled={!canPay}
+                onClick={openAddCredit}
+              >
+                <IconWallet className="size-3.5" />
+                Add store credit
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="grid grid-cols-1 divide-y divide-slate-200 border-t border-slate-200 sm:grid-cols-2 sm:divide-x sm:divide-y-0 lg:grid-cols-4">
-          <div className="flex flex-col p-5">
-            <p className="text-sm text-slate-500">Outstanding</p>
-            <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-semibold tracking-tight text-slate-900">
+        <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-4 lg:divide-y-0">
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Outstanding</p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
                 {wholeAmount(summary.owed)}
               </span>
               {Math.abs(accountStats.outstandingDelta) >= 0.5 && (
-                <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-700">
+                <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
                   {signedWhole(accountStats.outstandingDelta)}
                 </span>
               )}
             </div>
             {summary.creditLimit > 0 ? (
               <>
-                <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-slate-100">
                   <div
                     className={`h-full rounded-full ${
                       accountStats.limitPct >= 90
@@ -1192,94 +1197,73 @@ export default function CustomerDetailPage() {
                     style={{ width: `${Math.min(100, accountStats.limitPct)}%` }}
                   />
                 </div>
-                <div className="mt-1.5 flex justify-between text-xs text-slate-500">
-                  <span>Credit limit {wholeAmount(summary.creditLimit)}</span>
+                <div className="mt-1 flex justify-between gap-2 text-[10px] text-slate-500">
+                  <span>Limit {wholeAmount(summary.creditLimit)}</span>
                   <span
                     className={`font-medium ${
                       (accountStats.available ?? 0) < 1 ? "text-rose-700" : "text-slate-600"
                     }`}
                   >
-                    {money(accountStats.available ?? 0)} available
+                    {money(accountStats.available ?? 0)} avail.
                   </span>
                 </div>
-                <button
-                  type="button"
-                  className="mt-auto self-start pt-4 inline-flex items-center gap-1 text-sm font-medium text-indigo-700 hover:underline print:hidden"
-                  onClick={openEdit}
-                >
-                  Edit limit
-                </button>
               </>
             ) : (
-              <p className="mt-3 text-sm text-slate-500">No credit limit set</p>
+              <p className="mt-1 text-[11px] text-slate-500">No credit limit set</p>
             )}
           </div>
 
-          <div className="flex flex-col p-5">
-            <p className="text-sm text-slate-500">Open receipts</p>
-            <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-semibold tracking-tight text-slate-900">
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Open receipts</p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
                 {summary.openReceipts}
               </span>
               {accountStats.openDue > 0.009 && (
-                <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-700">
+                <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
                   +{wholeAmount(accountStats.openDue)}
                 </span>
               )}
             </div>
             {accountStats.dueSoonCount > 0 ? (
-              <p className="mt-3 inline-flex items-center gap-1.5 self-start rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
-                <svg
-                  className="size-3.5"
-                  viewBox="0 0 20 20"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.75"
-                  aria-hidden="true"
-                >
-                  <circle cx="10" cy="10" r="6.5" />
-                  <path d="M10 6.5V10l2.5 1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                {accountStats.dueSoonCount} due within 7 days · {money(accountStats.dueSoonAmount)}
+              <p className="mt-1.5 inline-flex items-center gap-1 self-start rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                {accountStats.dueSoonCount} due in 7d · {money(accountStats.dueSoonAmount)}
               </p>
             ) : (
-              <p className="mt-3 text-sm text-slate-500">
-                {summary.openReceipts ? "Nothing due within 7 days" : "No open receipts"}
+              <p className="mt-1 text-[11px] text-slate-500">
+                {summary.openReceipts ? "Nothing due in 7 days" : "No open receipts"}
               </p>
             )}
             <button
               type="button"
-              className="mt-auto self-start pt-4 inline-flex items-center gap-1 text-sm font-medium text-indigo-700 hover:underline print:hidden"
+              className="mt-1.5 self-start text-[11px] font-medium text-indigo-700 hover:underline print:hidden"
               onClick={() => {
                 setTab("open");
                 document.getElementById("customer-records")?.scrollIntoView({ behavior: "smooth", block: "start" });
               }}
             >
-              View receipts
-              <svg className="size-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden="true">
-                <path d="M4 10h12M11 5l5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+              View receipts →
             </button>
           </div>
 
-          <div className="flex flex-col p-5">
-            <p className="text-sm text-slate-500">Collected</p>
-            <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-semibold tracking-tight text-slate-900">
+          <div className="flex flex-col px-3 py-2.5 sm:px-4">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Collected</p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
                 {wholeAmount(accountStats.collectedTotal)}
               </span>
               {accountStats.lastPay > 0.009 && (
-                <span className="rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700">
+                <span className="rounded bg-emerald-50 px-1 py-0.5 text-[10px] font-medium text-emerald-700">
                   +{wholeAmount(accountStats.lastPay)}
                 </span>
               )}
             </div>
-            <p className="mt-3 text-sm text-slate-500">
+            <p className="mt-1 text-[11px] text-slate-500">
               {detail.payments.length === 0
                 ? "No payments yet"
                 : `${detail.payments.length} payment${detail.payments.length === 1 ? "" : "s"}${
                     accountStats.lastPaymentAt
-                      ? `, last on ${new Date(accountStats.lastPaymentAt).toLocaleDateString("en-KE", {
+                      ? `, last ${new Date(accountStats.lastPaymentAt).toLocaleDateString("en-KE", {
                           day: "numeric",
                           month: "short",
                         })}`
@@ -1288,39 +1272,48 @@ export default function CustomerDetailPage() {
             </p>
             <button
               type="button"
-              className="mt-auto self-start pt-4 inline-flex items-center gap-1 text-sm font-medium text-indigo-700 hover:underline print:hidden"
+              className="mt-1.5 self-start text-[11px] font-medium text-indigo-700 hover:underline print:hidden"
               onClick={() => {
                 setTab("payments");
                 document.getElementById("customer-records")?.scrollIntoView({ behavior: "smooth", block: "start" });
               }}
             >
-              View payments
-              <svg className="size-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden="true">
-                <path d="M4 10h12M11 5l5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+              View payments →
             </button>
           </div>
 
-          <div className="flex flex-col p-5">
-            <p className="text-sm text-slate-500">Store credit</p>
-            <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-semibold tracking-tight text-slate-900">
+          <button
+            type="button"
+            className="flex flex-col px-3 py-2.5 text-left hover:bg-slate-50 sm:px-4 print:pointer-events-none"
+            disabled={!canPay}
+            onClick={openAddCredit}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Store credit</p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-emerald-700 sm:text-lg">
                 {wholeAmount(summary.storeCredit)}
               </span>
             </div>
-            <p className="mt-3 text-sm text-slate-500">
-              {summary.storeCredit > 0.009 ? "Available on account" : "No credit on account"}
+            <p className="mt-1 text-[11px] text-slate-500">
+              {summary.storeCredit > 0.009
+                ? "Available for future sales"
+                : "Overpayments land here"}
             </p>
-          </div>
+            {canPay ? (
+              <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+                Add credit →
+              </span>
+            ) : null}
+          </button>
         </div>
       </section>
 
       <section
         id="customer-records"
-        className="overflow-clip rounded-2xl bg-white shadow-sm ring-1 ring-slate-200 print:shadow-none"
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200 print:shadow-none"
       >
-        <div className="px-4 pt-4 sm:px-6 print:hidden">
-          <div role="tablist" aria-label="Customer records" className="inline-flex rounded-lg bg-indigo-50 p-1">
+        <div className="px-3 pt-2.5 sm:px-4 print:hidden">
+          <div role="tablist" aria-label="Customer records" className="inline-flex rounded-md bg-indigo-50 p-0.5">
             {(
               [
                 ["statement", "Statement", accountStats.statementRows.length],
@@ -1333,7 +1326,7 @@ export default function CustomerDetailPage() {
                 type="button"
                 role="tab"
                 aria-selected={tab === key}
-                className={`h-9 rounded-md px-3.5 text-sm transition ${
+                className={`h-7 rounded-md px-2.5 text-xs transition ${
                   tab === key
                     ? "bg-indigo-600 font-semibold text-white shadow-sm"
                     : "font-medium text-slate-600 hover:text-slate-900"
@@ -1351,16 +1344,16 @@ export default function CustomerDetailPage() {
 
         {tab === "statement" && (
           <>
-            <div className="flex flex-wrap items-center gap-3 p-4 sm:px-6 print:hidden">
-              <label className="relative min-w-[220px] flex-1 sm:max-w-xs">
+            <div className="flex flex-wrap items-center gap-2 px-3 py-2 sm:px-4 print:hidden">
+              <label className="relative min-w-[160px] flex-1 sm:max-w-xs">
                 <span className="sr-only">Search reference or detail</span>
-                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
                   <IconSearch className="size-4" />
                 </span>
                 <input
                   type="search"
                   placeholder="Search reference or detail"
-                  className="h-10 w-full rounded-lg border-0 bg-white pl-9 pr-3 text-sm ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 w-full rounded-lg border-0 bg-white pl-8 pr-2.5 text-xs ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
                   value={ledgerQ}
                   onChange={(e) => {
                     setLedgerQ(e.target.value);
@@ -1371,7 +1364,7 @@ export default function CustomerDetailPage() {
               <label className="relative">
                 <span className="sr-only">Filter movements</span>
                 <select
-                  className="h-10 min-w-[160px] appearance-none rounded-lg border-0 bg-white py-0 pl-3 pr-9 text-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 min-w-[140px] appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
                   value={ledgerFilter}
                   onChange={(e) => {
                     setLedgerFilter(e.target.value as typeof ledgerFilter);
@@ -1417,7 +1410,7 @@ export default function CustomerDetailPage() {
                   </svg>
                 </button>
                 {showDateRange && (
-                  <div className="absolute left-0 z-30 mt-2 w-72 rounded-xl bg-white p-3 shadow-lg ring-1 ring-slate-200 sm:left-auto sm:right-0">
+                  <div className="absolute left-0 z-30 mt-1.5 w-64 rounded-lg bg-white p-2.5 shadow-lg ring-1 ring-slate-200 sm:left-auto sm:right-0">
                     <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
                       Date range
                     </p>
@@ -1434,7 +1427,7 @@ export default function CustomerDetailPage() {
                         <button
                           key={key}
                           type="button"
-                          className={`rounded-lg px-2.5 py-2 text-left text-sm font-medium ${
+                          className={`rounded-md px-2 py-1.5 text-left text-xs font-medium ${
                             stmtPreset === key
                               ? "bg-indigo-50 text-indigo-800 ring-1 ring-inset ring-indigo-600/20"
                               : "text-slate-700 hover:bg-slate-50"
@@ -1467,7 +1460,7 @@ export default function CustomerDetailPage() {
                         From
                         <input
                           type="date"
-                          className="mt-1 h-10 w-full rounded-lg border-0 bg-white px-3 text-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                          className="mt-1 h-8 w-full rounded-lg border-0 bg-white px-2.5 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
                           value={draftFrom}
                           onChange={(e) => {
                             setDraftFrom(e.target.value);
@@ -1479,7 +1472,7 @@ export default function CustomerDetailPage() {
                         To
                         <input
                           type="date"
-                          className="mt-1 h-10 w-full rounded-lg border-0 bg-white px-3 text-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                          className="mt-1 h-8 w-full rounded-lg border-0 bg-white px-2.5 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
                           value={draftTo}
                           onChange={(e) => {
                             setDraftTo(e.target.value);
@@ -1489,7 +1482,7 @@ export default function CustomerDetailPage() {
                       </label>
                       <button
                         type="button"
-                        className="inline-flex h-10 w-full items-center justify-center rounded-lg bg-slate-900 px-3.5 text-sm font-semibold text-white hover:bg-slate-800"
+                        className="inline-flex h-8 w-full items-center justify-center rounded-lg bg-slate-900 px-2.5 text-xs font-semibold text-white hover:bg-slate-800"
                         onClick={() => {
                           let from = draftFrom;
                           let to = draftTo;
@@ -1515,7 +1508,7 @@ export default function CustomerDetailPage() {
                 <div className="relative z-20">
                   <button
                     type="button"
-                    className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-3.5 text-sm font-semibold text-white shadow-sm hover:bg-slate-800"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-slate-900 px-2.5 text-xs font-semibold text-white shadow-sm hover:bg-slate-800"
                     onClick={() => {
                       setShowDownload((v) => !v);
                       setShowMore(false);
@@ -1598,197 +1591,208 @@ export default function CustomerDetailPage() {
               </div>
             </div>
 
-            <dl className="grid grid-cols-2 gap-px border-t border-slate-200 bg-slate-200 md:grid-cols-4">
-              <div className="bg-white px-4 py-4 sm:px-6">
-                <dt className="text-sm text-slate-500">Opening balance</dt>
-                <dd className="mt-0.5 text-lg font-semibold">{money(statementPaging.openingBal)}</dd>
+            <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-4 lg:divide-y-0">
+              <div className="flex flex-col px-3 py-2.5 sm:px-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                  Opening balance
+                </p>
+                <span className="mt-0.5 font-mono text-base font-bold tracking-tight text-slate-900">
+                  {money(statementPaging.openingBal)}
+                </span>
               </div>
-              <div className="bg-rose-50 px-4 py-4 sm:px-6">
-                <dt className="text-sm text-rose-700">Charged</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-rose-800">
+              <div className="flex flex-col bg-rose-50/60 px-3 py-2.5 sm:px-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-rose-700">
+                  Charged
+                </p>
+                <span className="mt-0.5 font-mono text-base font-bold tracking-tight text-rose-800">
                   +{money(statementPaging.chargedTotal)}
-                </dd>
+                </span>
               </div>
-              <div className="bg-emerald-50 px-4 py-4 sm:px-6">
-                <dt className="text-sm text-emerald-700">Received</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-emerald-800">
+              <div className="flex flex-col bg-emerald-50/60 px-3 py-2.5 sm:px-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700">
+                  Received
+                </p>
+                <span className="mt-0.5 font-mono text-base font-bold tracking-tight text-emerald-800">
                   −{money(statementPaging.receivedTotal)}
-                </dd>
+                </span>
               </div>
-              <div className="bg-indigo-50 px-4 py-4 sm:px-6">
-                <dt className="text-sm text-indigo-700">Closing balance</dt>
-                <dd className="mt-0.5 flex flex-wrap items-center gap-2 text-lg font-semibold text-indigo-950">
-                  {money(statementPaging.closingBal)}
-                  {statementPaging.atLimit && (
-                    <span className="rounded-md bg-rose-100 px-1.5 py-0.5 text-xs font-medium text-rose-700">
+              <div className="flex flex-col bg-indigo-50/50 px-3 py-2.5 sm:px-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700">
+                  Closing balance
+                </p>
+                <div className="mt-0.5 flex flex-wrap items-baseline gap-1.5">
+                  <span className="font-mono text-base font-bold tracking-tight text-indigo-950">
+                    {money(statementPaging.closingBal)}
+                  </span>
+                  {statementPaging.atLimit ? (
+                    <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700">
                       At limit
                     </span>
-                  )}
-                </dd>
+                  ) : null}
+                </div>
               </div>
-            </dl>
-
-            <div className="sticky top-0 z-10 hidden grid-cols-[72px_minmax(140px,1fr)_minmax(180px,1.2fr)_120px_190px] items-center gap-x-5 border-t border-slate-200 bg-slate-50 px-6 py-2.5 text-sm font-medium text-slate-500 md:grid">
-              <span>Time</span>
-              <span>Transaction</span>
-              <span>Detail</span>
-              <span className="text-right">Amount</span>
-              <span>Balance after</span>
             </div>
 
             {!statementPaging.dayGroups?.length ? (
-              <p className="border-t border-slate-100 px-6 py-14 text-center text-sm text-slate-500">
+              <p className="border-t border-slate-100 px-4 py-10 text-center text-sm text-slate-500">
                 No movements match your search
               </p>
             ) : (
-              statementPaging.dayGroups.map((g) => (
-                <div key={g.key}>
-                  <div className="flex items-baseline justify-between border-t border-indigo-100 bg-indigo-50 px-4 py-2.5 sm:px-6">
-                    <span className="text-sm font-semibold text-indigo-900">{g.label}</span>
-                    <span className="text-xs font-medium text-indigo-700">
-                      Net {g.net >= 0 ? "+" : "−"}
-                      {money(Math.abs(g.net))}
-                    </span>
-                  </div>
-                  {g.rows.map((e) => {
-                    const isPay = e.type === "PAYMENT" || e.type === "WRITE_OFF";
-                    const isRefund = e.type === "CREDIT_REFUND";
-                    const due = dueChip(e.detail);
-                    const detailText =
-                      e.detail && !e.detail.startsWith("Credit sale") && !due ? e.detail : null;
-                    const pct = Math.min(
-                      100,
-                      Math.round((Math.max(0, e.balanceAfter) / ceiling) * 100)
-                    );
-                    const bar =
-                      pct >= 90 ? "bg-rose-500" : pct >= 60 ? "bg-amber-400" : "bg-emerald-500";
-                    const rowBg = isPay
-                      ? "bg-emerald-50/70 hover:bg-emerald-50"
-                      : isRefund
-                        ? "bg-violet-50/70 hover:bg-violet-50"
-                        : "bg-white hover:bg-sky-50/60";
-                    return (
-                      <div
-                        key={e.id}
-                        className={`grid grid-cols-[1fr_auto] gap-x-4 gap-y-2 border-t border-slate-100 px-4 py-4 sm:px-6 md:grid-cols-[72px_minmax(140px,1fr)_minmax(180px,1.2fr)_120px_190px] md:items-center md:gap-x-5 ${rowBg}`}
-                      >
-                        <span className="order-4 text-xs text-slate-500 md:order-none md:text-sm">
-                          {e.at ? timeLabel(e.at) : "—"}
-                        </span>
-                        <div className="order-1 md:order-none">
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                            <span className="font-medium text-slate-900">{e.ref}</span>
-                            <span
-                              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset ${typeBadge(e.type)}`}
-                            >
-                              {e.label}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="order-3 col-span-2 md:order-none md:col-span-1">
-                          {due ? (
-                            <span className="inline-flex items-center rounded-md bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
-                              Due {due}
-                            </span>
-                          ) : detailText ? (
-                            <p className="text-sm text-slate-500">{detailText}</p>
-                          ) : (
-                            <span className="text-slate-300">—</span>
-                          )}
-                        </div>
-                        <span className="order-2 text-right md:order-none">
-                          {e.owed > 0.009 ? (
-                            <span className="inline-block rounded-lg bg-rose-50 px-2.5 py-1 font-semibold text-rose-700">
-                              +{money(e.owed)}
-                            </span>
-                          ) : e.paid > 0.009 ? (
-                            <span className="inline-block rounded-lg bg-emerald-100 px-2.5 py-1 font-semibold text-emerald-800">
-                              −{money(e.paid)}
-                            </span>
-                          ) : (
-                            <span className="text-slate-300">—</span>
-                          )}
-                        </span>
-                        <div className="order-5 col-span-2 md:order-none md:col-span-1">
-                          <p className="font-medium text-slate-900">{money(e.balanceAfter)}</p>
-                          <div className="mt-1.5 flex items-center gap-2">
-                            <div className="h-1 flex-1 overflow-hidden rounded-full bg-slate-100">
-                              <div className={`h-full rounded-full ${bar}`} style={{ width: `${pct}%` }} />
+              <div className="overflow-x-auto border-t border-slate-200">
+                <table className="w-full min-w-[720px] text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50/80 text-left text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                      <th className="px-3 py-2.5 sm:px-4">Time</th>
+                      <th className="px-3 py-2.5 sm:px-4">Transaction</th>
+                      <th className="px-3 py-2.5 sm:px-4">Detail</th>
+                      <th className="px-3 py-2.5 text-right sm:px-4">Amount</th>
+                      <th className="px-3 py-2.5 text-right sm:px-4">Balance after</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {statementPaging.dayGroups.map((g) => (
+                      <Fragment key={g.key}>
+                        <tr className="border-b border-slate-100 bg-slate-50/90">
+                          <td
+                            colSpan={5}
+                            className="px-3 py-1.5 sm:px-4"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-semibold text-slate-700">
+                                {g.label}
+                              </span>
+                              <span className="font-mono text-[11px] font-medium text-slate-500">
+                                Net {g.net >= 0 ? "+" : "−"}
+                                {money(Math.abs(g.net))}
+                              </span>
                             </div>
-                            <span className="w-8 text-right text-xs text-slate-500">{pct}%</span>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ))
+                          </td>
+                        </tr>
+                        {g.rows.map((e) => {
+                          const due = dueChip(e.detail);
+                          const detailText =
+                            e.detail && !e.detail.startsWith("Credit sale") && !due
+                              ? e.detail
+                              : null;
+                          const receiptHref = receiptHrefFromLedger(e);
+                          return (
+                            <tr
+                              key={e.id}
+                              role={receiptHref ? "link" : undefined}
+                              tabIndex={receiptHref ? 0 : undefined}
+                              onClick={
+                                receiptHref ? () => router.push(receiptHref) : undefined
+                              }
+                              onKeyDown={
+                                receiptHref
+                                  ? (ev) => {
+                                      if (ev.key === "Enter" || ev.key === " ") {
+                                        ev.preventDefault();
+                                        router.push(receiptHref);
+                                      }
+                                    }
+                                  : undefined
+                              }
+                              className={`border-b border-slate-100 last:border-0 hover:bg-slate-50/70 ${
+                                receiptHref ? "cursor-pointer" : ""
+                              }`}
+                            >
+                              <td className="whitespace-nowrap px-3 py-2.5 text-[11px] text-slate-500 sm:px-4">
+                                {e.at ? timeLabel(e.at) : "—"}
+                              </td>
+                              <td className="px-3 py-2.5 sm:px-4">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="text-xs font-semibold text-slate-900">
+                                    {e.ref}
+                                  </span>
+                                  <span
+                                    className={`inline-flex rounded-full px-1.5 py-0.5 text-[10px] font-semibold ring-1 ring-inset ${typeBadge(e.type)}`}
+                                  >
+                                    {e.label}
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="px-3 py-2.5 sm:px-4">
+                                {due ? (
+                                  <span className="inline-flex rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                                    Due {due}
+                                  </span>
+                                ) : detailText ? (
+                                  <p className="max-w-xs truncate text-[11px] text-slate-500">
+                                    {detailText}
+                                  </p>
+                                ) : (
+                                  <span className="text-[11px] text-slate-300">—</span>
+                                )}
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2.5 text-right sm:px-4">
+                                {e.owed > 0.009 ? (
+                                  <span className="font-mono text-xs font-semibold text-rose-700">
+                                    +{money(e.owed)}
+                                  </span>
+                                ) : e.paid > 0.009 ? (
+                                  <span className="font-mono text-xs font-semibold text-emerald-700">
+                                    −{money(e.paid)}
+                                  </span>
+                                ) : (
+                                  <span className="text-[11px] text-slate-300">—</span>
+                                )}
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs font-semibold tabular-nums text-slate-900 sm:px-4">
+                                {money(e.balanceAfter)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-4 py-4 text-sm text-slate-500 sm:px-6">
-              <p>
-                Showing {statementPaging.from} to {statementPaging.to} of {statementPaging.total}{" "}
-                movements. Charged adds debt, received reduces it.
-              </p>
-              <nav aria-label="Pagination" className="flex items-center gap-1 print:hidden">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-3 py-2.5 text-xs text-slate-500 sm:px-4">
+              <span>
+                {statementPaging.total
+                  ? `Showing ${statementPaging.from} – ${statementPaging.to} of ${statementPaging.total}`
+                  : "Showing 0 of 0"}
+              </span>
+              <div className="flex gap-1.5 print:hidden">
                 <button
                   type="button"
+                  className={ghostBtn}
                   disabled={statementPaging.safePage <= 0}
-                  className="grid size-10 place-items-center rounded-lg text-slate-500 hover:bg-slate-50 disabled:text-slate-300"
                   onClick={() => setLedgerPage((p) => Math.max(0, p - 1))}
                 >
-                  ‹
+                  Previous
                 </button>
-                {Array.from({ length: Math.min(statementPaging.pageCount, 5) }, (_, i) => {
-                  const max = Math.min(statementPaging.pageCount, 5);
-                  const startPg = Math.min(
-                    Math.max(0, statementPaging.safePage - 2),
-                    Math.max(0, statementPaging.pageCount - max)
-                  );
-                  const n = startPg + i;
-                  return (
-                    <button
-                      key={n}
-                      type="button"
-                      aria-current={n === statementPaging.safePage ? "page" : undefined}
-                      className={`grid size-10 place-items-center rounded-lg text-sm font-semibold ${
-                        n === statementPaging.safePage
-                          ? "bg-slate-900 text-white"
-                          : "text-slate-600 hover:bg-slate-50"
-                      }`}
-                      onClick={() => setLedgerPage(n)}
-                    >
-                      {n + 1}
-                    </button>
-                  );
-                })}
                 <button
                   type="button"
+                  className={ghostBtn}
                   disabled={statementPaging.safePage >= statementPaging.pageCount - 1}
-                  className="grid size-10 place-items-center rounded-lg text-slate-500 hover:bg-slate-50 disabled:text-slate-300"
                   onClick={() =>
                     setLedgerPage((p) => Math.min(statementPaging.pageCount - 1, p + 1))
                   }
                 >
-                  ›
+                  Next
                 </button>
-              </nav>
+              </div>
             </div>
           </>
         )}
 
         {tab === "open" && (
           <>
-            <div className="flex flex-wrap items-center gap-3 p-4 sm:px-6 print:hidden">
-              <label className="relative min-w-[220px] flex-1 sm:max-w-xs">
+            <div className="flex flex-wrap items-center gap-2 px-3 py-2 sm:px-4 print:hidden">
+              <label className="relative min-w-[160px] flex-1 sm:max-w-xs">
                 <span className="sr-only">Search receipt or amount</span>
-                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
                   <IconSearch className="size-4" />
                 </span>
                 <input
                   type="search"
                   placeholder="Search receipt or amount"
-                  className="h-10 w-full rounded-lg border-0 bg-white pl-9 pr-3 text-sm ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 w-full rounded-lg border-0 bg-white pl-8 pr-2.5 text-xs ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
                   value={openQ}
                   onChange={(e) => {
                     setOpenQ(e.target.value);
@@ -1799,7 +1803,7 @@ export default function CustomerDetailPage() {
               <label className="relative">
                 <span className="sr-only">Filter by status</span>
                 <select
-                  className="h-10 min-w-[160px] appearance-none rounded-lg border-0 bg-white py-0 pl-3 pr-9 text-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 min-w-[140px] appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
                   value={openStatusFilter}
                   onChange={(e) => {
                     setOpenStatusFilter(e.target.value as typeof openStatusFilter);
@@ -1834,7 +1838,7 @@ export default function CustomerDetailPage() {
               <div className="ml-auto flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  className="inline-flex h-10 items-center gap-2 rounded-lg bg-amber-500 px-4 text-sm font-semibold text-amber-950 shadow-sm hover:bg-amber-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 disabled:opacity-50"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-amber-500 px-2.5 text-xs font-semibold text-amber-950 shadow-sm hover:bg-amber-400 disabled:opacity-50"
                   disabled={!customer.phone || accountStats.openDue < 0.01}
                   onClick={() => {
                     const phone = (customer.phone || "").replace(/\s+/g, "");
@@ -1851,25 +1855,25 @@ export default function CustomerDetailPage() {
             </div>
 
             <dl className="grid grid-cols-2 gap-px border-t border-slate-200 bg-slate-200 md:grid-cols-3">
-              <div className="bg-white px-4 py-4 sm:px-6">
-                <dt className="text-sm text-slate-500">Sale total</dt>
-                <dd className="mt-0.5 text-lg font-semibold">{money(accountStats.openSaleTotal)}</dd>
+              <div className="bg-white px-3 py-2 sm:px-4">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Sale total</dt>
+                <dd className="mt-0.5 text-sm font-bold">{money(accountStats.openSaleTotal)}</dd>
               </div>
-              <div className="bg-emerald-50 px-4 py-4 sm:px-6">
-                <dt className="text-sm text-emerald-700">Already paid</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-emerald-800">
+              <div className="bg-emerald-50 px-3 py-2 sm:px-4">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700">Already paid</dt>
+                <dd className="mt-0.5 text-sm font-bold text-emerald-800">
                   {money(accountStats.openPaidTotal)}
                 </dd>
               </div>
-              <div className="col-span-2 bg-rose-50 px-4 py-4 sm:px-6 md:col-span-1">
-                <dt className="text-sm text-rose-700">Still due</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-rose-800">
+              <div className="col-span-2 bg-rose-50 px-3 py-2 sm:px-4 md:col-span-1">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-rose-700">Still due</dt>
+                <dd className="mt-0.5 text-sm font-bold text-rose-800">
                   {money(accountStats.openDue)}
                 </dd>
               </div>
             </dl>
 
-            <div className="sticky top-0 z-10 hidden grid-cols-[minmax(150px,1fr)_120px_120px_minmax(200px,1.3fr)_130px_84px] items-center gap-x-6 border-t border-slate-200 bg-slate-50 px-6 py-2.5 text-sm font-medium text-slate-500 md:grid">
+            <div className="sticky top-0 z-10 hidden grid-cols-[minmax(150px,1fr)_120px_120px_minmax(200px,1.3fr)_130px_84px] items-center gap-x-3 border-t border-slate-200 bg-slate-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500 sm:px-4 md:grid">
               <span>Receipt</span>
               <span className="text-right">Sale total</span>
               <span className="text-right">Already paid</span>
@@ -1879,7 +1883,7 @@ export default function CustomerDetailPage() {
             </div>
 
             {!openPaging.pageRows.length ? (
-              <p className="border-t border-slate-100 px-6 py-14 text-center text-sm text-slate-500">
+              <p className="border-t border-slate-100 px-4 py-8 text-center text-xs text-slate-500">
                 {detail.openCharges.length ? "No receipts match your filters" : "No open credit receipts"}
               </p>
             ) : (
@@ -1891,11 +1895,20 @@ export default function CustomerDetailPage() {
                 return (
                   <div
                     key={ch.saleId}
-                    className="grid grid-cols-2 gap-x-4 gap-y-3 border-t border-slate-100 px-4 py-4 hover:bg-indigo-50/40 sm:px-6 md:grid-cols-[minmax(150px,1fr)_120px_120px_minmax(200px,1.3fr)_130px_84px] md:items-center md:gap-x-6"
+                    role="link"
+                    tabIndex={0}
+                    onClick={() => router.push(`/receipts?saleId=${encodeURIComponent(ch.saleId)}`)}
+                    onKeyDown={(ev) => {
+                      if (ev.key === "Enter" || ev.key === " ") {
+                        ev.preventDefault();
+                        router.push(`/receipts?saleId=${encodeURIComponent(ch.saleId)}`);
+                      }
+                    }}
+                    className="grid cursor-pointer grid-cols-2 gap-x-4 gap-y-1.5 border-t border-slate-100 px-3 py-2 hover:bg-indigo-50/40 sm:px-4 md:grid-cols-[minmax(150px,1fr)_120px_120px_minmax(200px,1.3fr)_130px_84px] md:items-center md:gap-x-3"
                   >
                     <div className="order-1 md:order-none">
-                      <p className="font-semibold text-slate-900">Receipt #{ch.receiptNo}</p>
-                      <p className="mt-0.5 text-sm text-slate-500">
+                      <p className="text-sm font-semibold text-slate-900">Receipt #{ch.receiptNo}</p>
+                      <p className="mt-0.5 text-[11px] text-slate-500">
                         Sold{" "}
                         {new Date(ch.completedAt).toLocaleDateString("en-KE", {
                           day: "numeric",
@@ -1920,10 +1933,10 @@ export default function CustomerDetailPage() {
                     </div>
                     <div className="order-3 col-span-2 md:order-none md:col-span-1">
                       <div className="flex items-baseline justify-between gap-3">
-                        <span className="text-lg font-semibold text-slate-900">{money(ch.openAmount)}</span>
+                        <span className="text-sm font-bold text-slate-900">{money(ch.openAmount)}</span>
                         <span className="text-xs text-slate-500">{paidPct}% paid</span>
                       </div>
-                      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                      <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
                         <div
                           className="h-full rounded-full bg-emerald-500"
                           style={{ width: `${paidPct}%` }}
@@ -1954,8 +1967,11 @@ export default function CustomerDetailPage() {
                       {canPay && (
                         <button
                           type="button"
-                          className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg bg-indigo-50 px-4 text-sm font-semibold text-indigo-700 hover:bg-indigo-600 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 md:h-9 md:w-auto print:hidden"
-                          onClick={() => openPayReceipt(ch)}
+                          className="inline-flex h-7 w-full items-center justify-center gap-1 rounded-md bg-indigo-50 px-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-600 hover:text-white md:w-auto print:hidden"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            openPayReceipt(ch);
+                          }}
                         >
                           <IconWallet className="size-4" />
                           Pay
@@ -1981,16 +1997,16 @@ export default function CustomerDetailPage() {
 
         {tab === "payments" && (
           <>
-            <div className="flex flex-wrap items-center gap-3 p-4 sm:px-6 print:hidden">
-              <label className="relative min-w-[220px] flex-1 sm:max-w-xs">
+            <div className="flex flex-wrap items-center gap-2 px-3 py-2 sm:px-4 print:hidden">
+              <label className="relative min-w-[160px] flex-1 sm:max-w-xs">
                 <span className="sr-only">Search payment, receipt or collector</span>
-                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
                   <IconSearch className="size-4" />
                 </span>
                 <input
                   type="search"
                   placeholder="Search payment, receipt or collector"
-                  className="h-10 w-full rounded-lg border-0 bg-white pl-9 pr-3 text-sm ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 w-full rounded-lg border-0 bg-white pl-8 pr-2.5 text-xs ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
                   value={payQ}
                   onChange={(e) => {
                     setPayQ(e.target.value);
@@ -2001,7 +2017,7 @@ export default function CustomerDetailPage() {
               <label className="relative">
                 <span className="sr-only">Filter by method</span>
                 <select
-                  className="h-10 min-w-[160px] appearance-none rounded-lg border-0 bg-white py-0 pl-3 pr-9 text-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                  className="h-8 min-w-[140px] appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
                   value={payMethodFilter}
                   onChange={(e) => {
                     setPayMethodFilter(e.target.value as typeof payMethodFilter);
@@ -2037,19 +2053,19 @@ export default function CustomerDetailPage() {
             </div>
 
             <dl className="grid grid-cols-2 gap-px border-t border-slate-200 bg-slate-200 md:grid-cols-3">
-              <div className="bg-emerald-50 px-4 py-4 sm:px-6">
-                <dt className="text-sm text-emerald-700">Total received</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-emerald-800">
+              <div className="bg-emerald-50 px-3 py-2 sm:px-4">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700">Total received</dt>
+                <dd className="mt-0.5 text-sm font-bold text-emerald-800">
                   {money(accountStats.collectedTotal)}
                 </dd>
               </div>
-              <div className="bg-white px-4 py-4 sm:px-6">
-                <dt className="text-sm text-slate-500">Payments</dt>
-                <dd className="mt-0.5 text-lg font-semibold">{detail.payments.length}</dd>
+              <div className="bg-white px-3 py-2 sm:px-4">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Payments</dt>
+                <dd className="mt-0.5 text-sm font-bold">{detail.payments.length}</dd>
               </div>
-              <div className="col-span-2 bg-indigo-50 px-4 py-4 sm:px-6 md:col-span-1">
-                <dt className="text-sm text-indigo-700">Last payment</dt>
-                <dd className="mt-0.5 text-lg font-semibold text-indigo-950">
+              <div className="col-span-2 bg-indigo-50 px-3 py-2 sm:px-4 md:col-span-1">
+                <dt className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700">Last payment</dt>
+                <dd className="mt-0.5 text-sm font-bold text-indigo-950">
                   {accountStats.lastPaymentAt
                     ? new Date(accountStats.lastPaymentAt).toLocaleDateString("en-KE", {
                         day: "numeric",
@@ -2061,7 +2077,7 @@ export default function CustomerDetailPage() {
               </div>
             </dl>
 
-            <div className="sticky top-0 z-10 hidden grid-cols-[minmax(150px,1fr)_110px_minmax(120px,1fr)_minmax(150px,1fr)_140px_110px] items-center gap-x-6 border-t border-slate-200 bg-slate-50 px-6 py-2.5 text-sm font-medium text-slate-500 md:grid">
+            <div className="sticky top-0 z-10 hidden grid-cols-[minmax(150px,1fr)_110px_minmax(120px,1fr)_minmax(150px,1fr)_140px_110px] items-center gap-x-3 border-t border-slate-200 bg-slate-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500 sm:px-4 md:grid">
               <span>Payment</span>
               <span>Method</span>
               <span>Applied to</span>
@@ -2071,7 +2087,7 @@ export default function CustomerDetailPage() {
             </div>
 
             {!payPaging.pageRows.length ? (
-              <p className="border-t border-slate-100 px-6 py-14 text-center text-sm text-slate-500">
+              <p className="border-t border-slate-100 px-4 py-8 text-center text-xs text-slate-500">
                 {detail.payments.length ? "No payments match your filters" : "No payments recorded yet"}
               </p>
             ) : (
@@ -2092,11 +2108,11 @@ export default function CustomerDetailPage() {
                 return (
                   <div
                     key={p.id}
-                    className="grid grid-cols-2 gap-x-4 gap-y-3 border-t border-slate-100 px-4 py-4 hover:bg-emerald-50/40 sm:px-6 md:grid-cols-[minmax(150px,1fr)_110px_minmax(120px,1fr)_minmax(150px,1fr)_140px_110px] md:items-center md:gap-x-6"
+                    className="grid grid-cols-2 gap-x-4 gap-y-1.5 border-t border-slate-100 px-3 py-2 hover:bg-emerald-50/40 sm:px-4 md:grid-cols-[minmax(150px,1fr)_110px_minmax(120px,1fr)_minmax(150px,1fr)_140px_110px] md:items-center md:gap-x-3"
                   >
                     <div className="order-1 md:order-none">
-                      <p className="font-semibold text-slate-900">Payment #{p.receiptNo}</p>
-                      <p className="mt-0.5 text-sm text-slate-500">{formatWhen(p.createdAt)}</p>
+                      <p className="text-sm font-semibold text-slate-900">Payment #{p.receiptNo}</p>
+                      <p className="mt-0.5 text-[11px] text-slate-500">{formatWhen(p.createdAt)}</p>
                     </div>
                     <div className="order-3 md:order-none">
                       <span className="inline-flex items-center rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-800 ring-1 ring-inset ring-emerald-600/20">
@@ -2133,7 +2149,7 @@ export default function CustomerDetailPage() {
                     <div className="order-6 col-span-2 md:order-none md:col-span-1 md:text-right">
                       <button
                         type="button"
-                        className={`${ghostBtn} h-10 w-full justify-center md:h-9 md:w-auto print:hidden`}
+                        className={`${ghostBtn} w-full justify-center md:w-auto print:hidden`}
                         onClick={() => reprintPayment(p)}
                       >
                         <svg className="size-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden="true">
@@ -2188,18 +2204,53 @@ export default function CustomerDetailPage() {
                     >
                       {payTargetReceipt
                         ? `Pay receipt #${payTargetReceipt.receiptNo}`
-                        : "Record payment"}
+                        : payIntent === "credit"
+                          ? "Add store credit"
+                          : summary.owed > 0.009
+                            ? "Record payment"
+                            : "Add store credit"}
                     </h2>
                     <p className="text-sm text-slate-500">
-                      {customer.name} · {payTargetReceipt ? "this receipt" : "owes"}{" "}
-                      <span className="font-semibold text-rose-700">
-                        KSh{" "}
-                        {money(
-                          payTargetReceipt
-                            ? payTargetReceipt.openAmount
-                            : summary.owed
-                        )}
-                      </span>
+                      {payIntent === "credit" || summary.owed <= 0.009 ? (
+                        <>
+                          {customer.name} · prepaid balance for future sales
+                          {summary.storeCredit > 0.009 ? (
+                            <>
+                              {" "}
+                              · current credit{" "}
+                              <span className="font-semibold text-emerald-700">
+                                KSh {money(summary.storeCredit)}
+                              </span>
+                            </>
+                          ) : null}
+                          {summary.owed > 0.009 ? (
+                            <>
+                              {" "}
+                              · open debt{" "}
+                              <span className="font-semibold text-rose-700">
+                                KSh {money(summary.owed)}
+                              </span>{" "}
+                              is cleared first
+                            </>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          {customer.name} · {payTargetReceipt ? "this receipt" : "owes"}{" "}
+                          <span className="font-semibold text-rose-700">
+                            KSh{" "}
+                            {money(
+                              payTargetReceipt
+                                ? payTargetReceipt.openAmount
+                                : summary.owed
+                            )}
+                          </span>
+                          <span className="text-slate-400">
+                            {" "}
+                            · pay more to keep the rest as store credit
+                          </span>
+                        </>
+                      )}
                     </p>
                     {payTargetReceipt &&
                       (() => {
@@ -2256,23 +2307,25 @@ export default function CustomerDetailPage() {
                       htmlFor="pay-amount"
                       className="text-sm font-medium text-slate-700"
                     >
-                      Amount received
+                      {payIntent === "credit" ? "Credit amount" : "Amount received"}
                     </label>
-                    <button
-                      type="button"
-                      className="text-sm font-medium text-indigo-700 hover:underline"
-                      onClick={() =>
-                        setPayAmount(
-                          String(
-                            payTargetReceipt
-                              ? payTargetReceipt.openAmount
-                              : summary.owed
+                    {summary.owed > 0.009 ? (
+                      <button
+                        type="button"
+                        className="text-sm font-medium text-indigo-700 hover:underline"
+                        onClick={() =>
+                          setPayAmount(
+                            String(
+                              payTargetReceipt
+                                ? payTargetReceipt.openAmount
+                                : summary.owed
+                            )
                           )
-                        )
-                      }
-                    >
-                      Pay full balance
-                    </button>
+                        }
+                      >
+                        Pay full balance
+                      </button>
+                    ) : null}
                   </div>
                   <div className="relative mt-1.5">
                     <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-lg font-medium text-slate-400">
@@ -2397,7 +2450,7 @@ export default function CustomerDetailPage() {
                   </div>
                 </div>
 
-                {allocations.length > 0 && (
+                {allocations.length > 0 ? (
                   <section
                     aria-labelledby="pay-alloc"
                     className="overflow-hidden rounded-xl ring-1 ring-slate-200"
@@ -2411,10 +2464,10 @@ export default function CustomerDetailPage() {
                         </h3>
                         <p className="text-sm text-slate-500">
                           {!payTargetReceipt
-                            ? "Oldest first, by due date then sale date."
+                            ? "Oldest first, by due date then sale date. Excess becomes store credit."
                             : allocations.length === 1
-                              ? "Only this open receipt will be reduced."
-                              : `Receipt #${payTargetReceipt.receiptNo} first, then the rest oldest first.`}
+                              ? "Only this open receipt will be reduced. Excess becomes store credit."
+                              : `Receipt #${payTargetReceipt.receiptNo} first, then the rest oldest first. Excess becomes store credit.`}
                         </p>
                       </div>
                       <span className="rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-600/20">
@@ -2492,7 +2545,7 @@ export default function CustomerDetailPage() {
                         </p>
                       </div>
                       <div className="bg-emerald-50 px-4 py-3">
-                        <p className="text-emerald-700">Allocated</p>
+                        <p className="text-emerald-700">Applied to debt</p>
                         <p className="font-semibold text-emerald-900">
                           {money(payStats.allocated)}
                         </p>
@@ -2501,9 +2554,7 @@ export default function CustomerDetailPage() {
                         <p className="text-indigo-700">
                           {payStats.storeCredit > 0.009
                             ? "Kept as store credit"
-                            : payTargetReceipt
-                              ? "Account still due after"
-                              : "Still due after"}
+                            : "Still due after"}
                         </p>
                         <p className="font-semibold text-indigo-950">
                           {money(
@@ -2515,13 +2566,41 @@ export default function CustomerDetailPage() {
                       </div>
                     </div>
                   </section>
-                )}
+                ) : payStats.amount > 0.009 ? (
+                  <section
+                    aria-labelledby="pay-credit-only"
+                    className="overflow-hidden rounded-xl ring-1 ring-slate-200"
+                  >
+                    <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
+                      <h3 id="pay-credit-only" className="font-semibold text-slate-900">
+                        How this is applied
+                      </h3>
+                      <p className="text-sm text-slate-500">
+                        No open receipts — the full amount is kept as store credit.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-px bg-slate-200 text-sm">
+                      <div className="bg-emerald-50 px-4 py-3">
+                        <p className="text-emerald-700">Applied to debt</p>
+                        <p className="font-semibold text-emerald-900">0.00</p>
+                      </div>
+                      <div className="bg-indigo-50 px-4 py-3">
+                        <p className="text-indigo-700">Kept as store credit</p>
+                        <p className="font-semibold text-indigo-950">
+                          {money(payStats.amount)}
+                        </p>
+                      </div>
+                    </div>
+                  </section>
+                ) : null}
               </div>
 
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-white px-6 py-4">
                 <p className="text-sm text-slate-500" aria-live="polite">
                   {payStats.amount > 0
-                    ? `Allocated KSh ${money(payStats.allocated)} of KSh ${money(payStats.amount)}`
+                    ? payStats.storeCredit > 0.009
+                      ? `Debt ${money(payStats.allocated)} · credit ${money(payStats.storeCredit)}`
+                      : `Applied KSh ${money(payStats.allocated)} of KSh ${money(payStats.amount)}`
                     : ""}
                 </p>
                 <div className="ml-auto flex items-center gap-2">
@@ -2551,7 +2630,10 @@ export default function CustomerDetailPage() {
                     </svg>
                     {saving
                       ? "Saving…"
-                      : `Record KSh ${money(payStats.amount)}`}
+                      : payIntent === "credit" ||
+                          (summary.owed <= 0.009 && payStats.storeCredit > 0.009)
+                        ? `Add KSh ${money(payStats.amount)} credit`
+                        : `Record KSh ${money(payStats.amount)}`}
                   </button>
                 </div>
               </div>
@@ -2637,75 +2719,6 @@ export default function CustomerDetailPage() {
         </div>
       )}
 
-      {showEdit && (
-        <div className="sf-modal-backdrop">
-          <form onSubmit={saveEdit} className="sf-modal max-w-md space-y-3">
-            <h2 className="text-lg font-semibold text-slate-900">Edit customer</h2>
-            {formError && <p className="sf-alert sf-alert-error">{formError}</p>}
-            <label className="block text-xs font-medium text-slate-500">
-              Name
-              <input
-                className="sf-input mt-1"
-                value={editForm.name}
-                onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
-                required
-              />
-            </label>
-            <label className="block text-xs font-medium text-slate-500">
-              Phone
-              <input
-                className="sf-input mt-1"
-                value={editForm.phone}
-                onChange={(e) => setEditForm({ ...editForm, phone: e.target.value })}
-              />
-            </label>
-            <label className="block text-xs font-medium text-slate-500">
-              Email
-              <input
-                className="sf-input mt-1"
-                value={editForm.email}
-                onChange={(e) => setEditForm({ ...editForm, email: e.target.value })}
-              />
-            </label>
-            <label className="block text-xs font-medium text-slate-500">
-              Credit limit
-              <input
-                className="sf-input mt-1"
-                value={editForm.creditLimit}
-                onChange={(e) => setEditForm({ ...editForm, creditLimit: e.target.value })}
-              />
-            </label>
-            <label className="block text-xs font-medium text-slate-500">
-              Price level
-              <select
-                className="sf-input mt-1"
-                value={editForm.priceLevelId}
-                onChange={(e) => setEditForm({ ...editForm, priceLevelId: e.target.value })}
-              >
-                <option value="">Default / Retail</option>
-                {levels.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.name} (-{l.discountPercent}%)
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="flex justify-end gap-2">
-              <button type="button" className={ghostBtn} onClick={() => setShowEdit(false)}>
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="rounded-lg bg-[var(--sf-brand)] px-3 py-2 text-sm font-medium text-white"
-                disabled={saving}
-              >
-                Save
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
       {receipt && (
         <div className="sf-modal-backdrop receipt-print-root">
           <div className="sf-modal max-w-sm">
@@ -2737,6 +2750,27 @@ export default function CustomerDetailPage() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmToggle}
+        title={
+          detail?.customer.active
+            ? `Deactivate ${detail.customer.name}?`
+            : `Activate ${detail?.customer.name || "customer"}?`
+        }
+        message={
+          detail?.customer.active
+            ? "They will be hidden from new sales. Existing balances and history stay on file."
+            : "They will appear again when selecting a customer on POS and credit sales."
+        }
+        confirmLabel={detail?.customer.active ? "Deactivate" : "Activate"}
+        tone={detail?.customer.active ? "danger" : "success"}
+        loading={toggleBusy}
+        onCancel={() => {
+          if (!toggleBusy) setConfirmToggle(false);
+        }}
+        onConfirm={runToggleActive}
+      />
     </div>
   );
 }

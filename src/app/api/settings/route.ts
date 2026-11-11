@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageUsers } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { getShopSettings } from "@/lib/settings";
 import { writeAudit } from "@/lib/audit";
 import { zodErrorResponse } from "@/lib/api";
@@ -29,7 +29,7 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageUsers(user.role)) return forbidden();
+  if (!hasPermission(user, "settings.manage")) return forbidden();
 
   try {
     const body = patchSchema.parse(await req.json());

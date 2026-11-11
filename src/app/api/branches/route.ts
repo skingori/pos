@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageBranches } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { ensureMainBranch } from "@/lib/branch";
 
@@ -23,7 +23,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageBranches(user.role)) return forbidden();
+  if (!hasPermission(user, "branches.manage")) return forbidden();
 
   const body = await req.json();
   const name = String(body.name || "").trim();

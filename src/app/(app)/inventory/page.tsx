@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { formatKes, marginPercent, suggestedSellPrice } from "@/lib/money";
 import { toCsv } from "@/lib/csv";
 import { useSession } from "next-auth/react";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { Role } from "@prisma/client";
-import { PageHeader } from "@/components/ui/page-header";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { SelectMenu } from "@/components/ui/select-menu";
+import { useToast } from "@/components/ui/toast";
 
 type Product = {
   id: string;
@@ -35,15 +37,12 @@ type Tab = "products" | "returns" | "categories";
 type StatusFilter = "all" | "in_stock" | "low" | "out";
 type ColKey =
   | "photo"
-  | "sku"
-  | "barcode"
+  | "identifiers"
   | "category"
-  | "cost"
-  | "sell"
+  | "pricing"
   | "margin"
   | "qty"
   | "returns"
-  | "reorder"
   | "cog"
   | "alert";
 
@@ -60,18 +59,59 @@ const UNITS = [
 
 const COLUMN_OPTIONS: { key: ColKey; label: string; defaultOn: boolean }[] = [
   { key: "photo", label: "Photo", defaultOn: true },
-  { key: "sku", label: "SKU", defaultOn: true },
-  { key: "barcode", label: "Barcode", defaultOn: false },
+  { key: "identifiers", label: "SKU / Barcode", defaultOn: true },
   { key: "category", label: "Category", defaultOn: true },
-  { key: "cost", label: "Cost", defaultOn: false },
-  { key: "sell", label: "Sell", defaultOn: true },
-  { key: "margin", label: "Margin", defaultOn: false },
+  { key: "pricing", label: "Cost → Sell", defaultOn: true },
+  { key: "margin", label: "Margin", defaultOn: true },
   { key: "qty", label: "Quantity", defaultOn: true },
-  { key: "reorder", label: "Reorder level", defaultOn: false },
   { key: "returns", label: "Returns", defaultOn: false },
   { key: "cog", label: "Stock value", defaultOn: false },
-  { key: "alert", label: "Alert", defaultOn: true },
+  { key: "alert", label: "Status", defaultOn: true },
 ];
+
+function stockStatus(qty: number, reorderLevel: number) {
+  if (qty <= 0) return { label: "OUT OF STOCK", tone: "bg-rose-100 text-rose-800" };
+  if (qty <= reorderLevel) return { label: "LOW STOCK", tone: "bg-amber-100 text-amber-900" };
+  return { label: "IN STOCK", tone: "bg-emerald-100 text-emerald-800" };
+}
+
+const AVATAR_TONES = [
+  "bg-rose-100 text-rose-700",
+  "bg-violet-100 text-violet-700",
+  "bg-sky-100 text-sky-700",
+  "bg-amber-100 text-amber-800",
+  "bg-emerald-100 text-emerald-700",
+  "bg-orange-100 text-orange-800",
+  "bg-fuchsia-100 text-fuchsia-700",
+  "bg-cyan-100 text-cyan-800",
+];
+
+function initials(name: string) {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0])
+    .join("")
+    .toUpperCase();
+}
+
+function avatarTone(seed: string) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h + seed.charCodeAt(i) * (i + 1)) % AVATAR_TONES.length;
+  return AVATAR_TONES[h];
+}
+
+function shortKes(n: number) {
+  if (Math.abs(n) >= 1_000_000) return `KSh ${(n / 1_000_000).toFixed(1)}m`;
+  if (Math.abs(n) >= 1_000) return `KSh ${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return formatKes(n);
+}
+
+function markupPercent(cost: number, sell: number) {
+  if (cost <= 0) return 0;
+  return ((sell - cost) / cost) * 100;
+}
 
 const emptyForm = {
   name: "",
@@ -111,8 +151,11 @@ function defaultColumns(): Record<ColKey, boolean> {
 }
 
 export default function InventoryPage() {
+  const router = useRouter();
   const { data: session } = useSession();
-  const canEdit = session?.user?.role && canManageInventory(session.user.role as Role);
+  const toast = useToast();
+  const canEdit = hasPermission(session?.user, "inventory.manage");
+  const canPurchase = hasPermission(session?.user, "purchasing.manage");
   const fileRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const columnsRef = useRef<HTMLDivElement>(null);
@@ -125,7 +168,7 @@ export default function InventoryPage() {
   const [q, setQ] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(25);
   const [page, setPage] = useState(1);
   const [columns, setColumns] = useState(defaultColumns);
   const [showColumns, setShowColumns] = useState(false);
@@ -133,14 +176,29 @@ export default function InventoryPage() {
   const [editing, setEditing] = useState<Product | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState("");
-  const [importMsg, setImportMsg] = useState("");
   const [newCategory, setNewCategory] = useState("");
+  const [categoryError, setCategoryError] = useState("");
+  const [savingCategory, setSavingCategory] = useState(false);
+  const [showCategoryForm, setShowCategoryForm] = useState(false);
+  const [editingCategory, setEditingCategory] = useState<Category | null>(null);
+  const [deleteCategoryTarget, setDeleteCategoryTarget] = useState<{
+    id: string;
+    name: string;
+    productCount: number;
+  } | null>(null);
+  const [deleteCategoryBusy, setDeleteCategoryBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showMore, setShowMore] = useState(false);
+  const [showHeaderMore, setShowHeaderMore] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [qtyEditId, setQtyEditId] = useState<string | null>(null);
-  const [qtyDraft, setQtyDraft] = useState("");
-  const [qtySaving, setQtySaving] = useState(false);
+  const [deactivateTarget, setDeactivateTarget] = useState<Product | null>(null);
+  const [deactivateBusy, setDeactivateBusy] = useState(false);
+  const [notice, setNotice] = useState<null | { title: string; message: string }>(null);
+
+  const ghostBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-50 disabled:opacity-50";
+  const primaryBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50";
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
 
@@ -167,13 +225,17 @@ export default function InventoryPage() {
 
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
+      const target = e.target as HTMLElement | null;
       if (!columnsRef.current?.contains(e.target as Node)) {
         setShowColumns(false);
       }
+      if (!target?.closest("[data-inv-header-menu]")) {
+        setShowHeaderMore(false);
+      }
     }
-    if (showColumns) document.addEventListener("mousedown", onDocClick);
+    if (showColumns || showHeaderMore) document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
-  }, [showColumns]);
+  }, [showColumns, showHeaderMore]);
 
   useEffect(() => {
     setPage(1);
@@ -189,19 +251,30 @@ export default function InventoryPage() {
   );
 
   const stats = useMemo(() => {
+    const units = sellable.reduce((s, p) => s + p.qty, 0);
     const stockValue = sellable.reduce((s, p) => s + p.cost * p.qty, 0);
-    const below = sellable.filter((p) => p.qty <= p.reorderLevel).length;
+    const retailValue = sellable.reduce((s, p) => s + p.sellPrice * p.qty, 0);
+    const below = sellable.filter((p) => p.qty <= p.reorderLevel && p.qty > 0).length;
+    const out = sellable.filter((p) => p.qty <= 0).length;
+    const returnUnits = returnSkus.reduce((s, p) => s + p.qty, 0);
+    const returnValue = returnSkus.reduce((s, p) => s + p.cost * p.qty, 0);
     const uncategorized = sellable.filter((p) => !p.categoryId).length;
-    const noBarcode = sellable.filter((p) => !p.barcode).length;
+    const blendedMargin = retailValue > 0 ? ((retailValue - stockValue) / retailValue) * 100 : 0;
     return {
       stockValue,
+      retailValue,
+      blendedMargin,
+      units,
       count: sellable.length,
       below,
+      out,
+      returnUnits,
+      returnValue,
+      returnCount: returnSkus.length,
+      categories: categories.length,
       uncategorized,
-      noBarcode,
-      needsOrganize: uncategorized + noBarcode,
     };
-  }, [sellable]);
+  }, [sellable, returnSkus, categories]);
 
   const filteredProducts = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -260,7 +333,7 @@ export default function InventoryPage() {
 
   const visibleColCount =
     1 +
-    COLUMN_OPTIONS.filter((c) => columns[c.key]).length +
+    COLUMN_OPTIONS.filter((c) => c.key !== "photo" && columns[c.key]).length +
     (canEdit ? 1 : 0);
 
   function clearImageSelection() {
@@ -389,42 +462,25 @@ export default function InventoryPage() {
     }
   }
 
-  async function remove(id: string) {
-    if (!confirm("Deactivate this product?")) return;
-    await fetch(`/api/products/${id}`, { method: "DELETE" });
-    load();
-  }
-
-  function startQtyEdit(p: Product) {
-    if (!canEdit) return;
-    setQtyEditId(p.id);
-    setQtyDraft(String(p.qty));
-  }
-
-  async function confirmQtyEdit(p: Product) {
-    const next = Number(qtyDraft);
-    if (!Number.isFinite(next) || next < 0) {
-      alert("Quantity must be 0 or more");
-      return;
+  async function confirmDeactivate() {
+    if (!deactivateTarget) return;
+    setDeactivateBusy(true);
+    try {
+      const res = await fetch(`/api/products/${deactivateTarget.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setDeactivateTarget(null);
+        setNotice({
+          title: "Could not deactivate product",
+          message: data.error || "Something went wrong. Try again.",
+        });
+        return;
+      }
+      setDeactivateTarget(null);
+      load();
+    } finally {
+      setDeactivateBusy(false);
     }
-    if (next === p.qty) {
-      setQtyEditId(null);
-      return;
-    }
-    setQtySaving(true);
-    const res = await fetch(`/api/products/${p.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ qty: next }),
-    });
-    setQtySaving(false);
-    if (!res.ok) {
-      const data = await res.json();
-      alert(data.error || "Could not update quantity");
-      return;
-    }
-    setQtyEditId(null);
-    load();
   }
 
   async function quarantineAction(p: Product, action: "releaseOpened" | "writeOffOpened") {
@@ -448,7 +504,10 @@ export default function InventoryPage() {
     });
     if (!res.ok) {
       const data = await res.json();
-      alert(data.error || "Failed");
+      setNotice({
+        title: "Could not update return stock",
+        message: data.error || "Something went wrong. Try again.",
+      });
       return;
     }
     load();
@@ -489,265 +548,434 @@ export default function InventoryPage() {
 
   async function onImportFile(file: File | null) {
     if (!file) return;
-    setImportMsg("");
     const formData = new FormData();
     formData.append("file", file);
     const res = await fetch("/api/products/import", { method: "POST", body: formData });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    const rowErrors = Array.isArray(data.errors)
+      ? data.errors.filter((e: unknown): e is string => typeof e === "string" && e.trim())
+      : [];
+    const errorCount =
+      typeof data.errorCount === "number" && data.errorCount > 0
+        ? data.errorCount
+        : rowErrors.length;
+    const created = Number(data.created) || 0;
+    const updated = Number(data.updated) || 0;
+
+    function importErrorToast() {
+      const first = (rowErrors[0] || "").trim();
+      const friendly = first
+        ? first.replace(/^Row\s+\d+:\s*/i, "").replace(/^\w/, (c) => c.toUpperCase())
+        : "Some rows could not be imported. Check cost, sell price, name, and SKU.";
+      const extra = errorCount > 1 ? ` (${errorCount} rows need fixing)` : "";
+      toast.error(`${friendly}${extra}`);
+    }
+
     if (!res.ok) {
-      setImportMsg(data.error || "Import failed");
+      if (typeof data.error === "string" && data.error.trim() && !rowErrors.length) {
+        toast.error(data.error.trim());
+      } else {
+        importErrorToast();
+      }
+      if (fileRef.current) fileRef.current.value = "";
       return;
     }
-    setImportMsg(
-      `Imported: ${data.created} created, ${data.updated} updated` +
-        (data.errorCount ? ` - ${data.errorCount} row error(s)` : "")
-    );
+
+    if (created + updated > 0) {
+      const parts = [];
+      if (created) parts.push(`${created} created`);
+      if (updated) parts.push(`${updated} updated`);
+      const cats = Number(data.categoriesCreated) || 0;
+      if (cats) parts.push(`${cats} new categor${cats === 1 ? "y" : "ies"}`);
+      toast.success(`Import complete — ${parts.join(", ")}`);
+    }
+    if (errorCount > 0) {
+      importErrorToast();
+    }
+
     load();
     if (fileRef.current) fileRef.current.value = "";
   }
 
-  async function addCategory(e: React.FormEvent) {
+  function openAddCategory() {
+    setEditingCategory(null);
+    setNewCategory("");
+    setCategoryError("");
+    setShowCategoryForm(true);
+  }
+
+  function openEditCategory(c: Category) {
+    setEditingCategory(c);
+    setNewCategory(c.name);
+    setCategoryError("");
+    setShowCategoryForm(true);
+  }
+
+  function closeCategoryForm() {
+    setShowCategoryForm(false);
+    setEditingCategory(null);
+    setNewCategory("");
+    setCategoryError("");
+  }
+
+  async function saveCategory(e: React.FormEvent) {
     e.preventDefault();
-    if (!newCategory.trim()) return;
-    const res = await fetch("/api/categories", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newCategory.trim() }),
-    });
-    if (res.ok) {
-      setNewCategory("");
+    const name = newCategory.trim();
+    if (!name) {
+      setCategoryError("Enter a category name");
+      return;
+    }
+    setSavingCategory(true);
+    setCategoryError("");
+    const res = editingCategory
+      ? await fetch(`/api/categories/${editingCategory.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        })
+      : await fetch("/api/categories", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+    const data = await res.json().catch(() => ({}));
+    setSavingCategory(false);
+    if (!res.ok) {
+      setCategoryError(
+        data.error || (editingCategory ? "Could not rename category" : "Could not add category")
+      );
+      return;
+    }
+    const createdId = !editingCategory && data?.id ? String(data.id) : "";
+    closeCategoryForm();
+    if (showForm && createdId) {
+      setForm((f) => ({ ...f, categoryId: createdId }));
+    }
+    load();
+  }
+
+  async function confirmDeleteCategory() {
+    if (!deleteCategoryTarget) return;
+    setDeleteCategoryBusy(true);
+    try {
+      const res = await fetch(`/api/categories/${deleteCategoryTarget.id}`, {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setDeleteCategoryTarget(null);
+        setNotice({
+          title: "Could not delete category",
+          message: data.error || "Something went wrong. Try again.",
+        });
+        return;
+      }
+      if (categoryId === deleteCategoryTarget.id) setCategoryId("");
+      setDeleteCategoryTarget(null);
       load();
+    } finally {
+      setDeleteCategoryBusy(false);
     }
   }
 
-  const tabs: { id: Tab; label: string; count: number }[] = [
-    { id: "products", label: "Products", count: sellable.length },
-    { id: "returns", label: "Return SKUs", count: returnSkus.length },
-    { id: "categories", label: "Categories", count: categories.length },
-  ];
+  const alertActive = tab === "products" && (status === "low" || status === "out");
 
   return (
-    <div className="space-y-5">
-      <PageHeader
-        title="Inventory"
-        description={`Stock at ${branchName} - capture products, categories, and return SKUs`}
-        actions={
-          canEdit ? (
-            <button type="button" onClick={openCreate} className="sf-btn sf-btn-primary">
-              + Add product
-            </button>
-          ) : undefined
-        }
-      />
-
-      {canEdit && (
-        <div className="sf-card border-teal-200/80 bg-gradient-to-br from-teal-50/90 to-white p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="font-semibold text-[var(--sf-brand)]">Import from CSV</h2>
-              <p className="mt-1 max-w-2xl text-sm text-slate-600">
-                Add many products at once. Download the template, fill it in, then upload. Quantity =
-                count (pcs), weight (kg, g), or volume (L, m). Add categories later in the Categories
-                tab.
-              </p>
-              {importMsg && <p className="mt-2 text-sm text-teal-800">{importMsg}</p>}
+    <div className="space-y-4 px-1 py-1 sm:px-0 [font-variant-numeric:tabular-nums]">
+      <section
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+        aria-label="Inventory overview"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold tracking-tight text-slate-900 sm:text-lg">
+              Inventory
+            </h1>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-slate-500">
+                Stock and product master at {branchName}
+              </span>
+              {stats.below + stats.out > 0 && (
+                <span className="rounded-full bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 ring-1 ring-inset ring-rose-600/20">
+                  {stats.below + stats.out} need restock
+                </span>
+              )}
+              {stats.returnUnits > 0 && (
+                <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                  {stats.returnUnits.toLocaleString()} return units
+                </span>
+              )}
             </div>
-            <div className="flex flex-wrap gap-2">
-              <button type="button" className="sf-btn sf-btn-ghost" onClick={downloadTemplate}>
-                Download CSV template
-              </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <div className="relative" data-inv-header-menu>
               <button
                 type="button"
-                className="sf-btn sf-btn-accent"
-                onClick={() => fileRef.current?.click()}
+                className={ghostBtn}
+                aria-expanded={showHeaderMore}
+                onClick={() => setShowHeaderMore((v) => !v)}
               >
-                Choose CSV file
+                More
+                <svg className="size-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75">
+                  <path d="M5 8l5 5 5-5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
               </button>
-              <input
-                ref={fileRef}
-                type="file"
-                accept=".csv,text/csv"
-                className="hidden"
-                onChange={(e) => onImportFile(e.target.files?.[0] || null)}
-              />
+              {showHeaderMore && (
+                <div className="absolute end-0 z-30 mt-1.5 w-44 overflow-hidden rounded-lg bg-white py-1 shadow-lg ring-1 ring-slate-200">
+                  <button
+                    type="button"
+                    className="flex w-full items-center px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50"
+                    onClick={() => {
+                      setShowHeaderMore(false);
+                      exportCsv();
+                    }}
+                  >
+                    Export CSV
+                  </button>
+                  {canEdit && (
+                    <>
+                      <button
+                        type="button"
+                        className="flex w-full items-center px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50"
+                        onClick={() => {
+                          setShowHeaderMore(false);
+                          downloadTemplate();
+                        }}
+                      >
+                        CSV template
+                      </button>
+                      <button
+                        type="button"
+                        className="flex w-full items-center px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50"
+                        onClick={() => {
+                          setShowHeaderMore(false);
+                          fileRef.current?.click();
+                        }}
+                      >
+                        Import CSV
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
+            {canEdit && (
+              <button type="button" className={primaryBtn} onClick={openCreate}>
+                + Add product
+              </button>
+            )}
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={(e) => onImportFile(e.target.files?.[0] || null)}
+            />
           </div>
         </div>
-      )}
 
-      <div className="grid gap-3 sm:grid-cols-3">
-        <div className="sf-card sf-stat p-4">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-            Total stock value
-          </div>
-          <div className="mt-2 text-2xl font-semibold tracking-tight text-[var(--sf-brand)]">
-            {formatKes(stats.stockValue)}
-          </div>
-          <p className="mt-1 text-xs text-slate-500">Current cost of all items</p>
-        </div>
-        <div className="sf-card sf-stat p-4">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-            Products in inventory
-          </div>
-          <div className="mt-2 text-2xl font-semibold tracking-tight text-[var(--sf-brand)]">
-            {stats.count}
-          </div>
-          <p className="mt-1 text-xs text-slate-500">Total distinct products</p>
-        </div>
-        <button
-          type="button"
-          className="sf-card sf-stat p-4 text-left transition hover:ring-1 hover:ring-slate-300"
-          onClick={() => {
-            setTab("products");
-            setStatus("low");
-          }}
-        >
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-            Below reorder
-          </div>
-          <div
-            className={`mt-2 text-2xl font-semibold tracking-tight ${
-              stats.below > 0 ? "text-rose-600" : "text-[var(--sf-brand)]"
-            }`}
-          >
-            {stats.below}
-          </div>
-          <p className="mt-1 text-xs text-slate-500">Items that need restocking soon</p>
-        </button>
-      </div>
-
-      {stats.needsOrganize > 0 && (
-        <div className="sf-alert sf-alert-warn flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <strong>
-              {stats.needsOrganize} product{stats.needsOrganize === 1 ? "" : "s"} need organizing
-            </strong>
-            <p className="mt-0.5 text-sm">
-              Capture products quickly first. Later, use categories to make reports cleaner.{" "}
-              {stats.uncategorized} uncategorized - {stats.noBarcode} without barcode
-            </p>
-          </div>
+        <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-4 lg:divide-y-0">
           <button
             type="button"
-            className="sf-btn sf-btn-ghost bg-white/80"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              tab === "products" && status === "all" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
             onClick={() => {
               setTab("products");
-              setCategoryId("");
               setStatus("all");
-              setQ("");
             }}
           >
-            Organize now
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Stock at cost
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {shortKes(stats.stockValue)}
+              </span>
+              <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
+                {stats.count} SKUs
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {stats.units.toLocaleString()} units · retail {shortKes(stats.retailValue)}
+            </p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              {stats.blendedMargin.toFixed(1)}% margin →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              alertActive ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setTab("products");
+              setStatus(stats.out > 0 ? "out" : "low");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Low / Out of stock
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span
+                className={`font-mono text-base font-bold tracking-tight sm:text-lg ${
+                  stats.below + stats.out > 0 ? "text-rose-600" : "text-slate-900"
+                }`}
+              >
+                {stats.below} / {stats.out}
+              </span>
+            </div>
+            {stats.below + stats.out > 0 ? (
+              <p className="mt-1.5 inline-flex items-center self-start rounded bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 ring-1 ring-inset ring-rose-600/20">
+                Needs restock attention
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-slate-500">Stock levels healthy</p>
+            )}
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              View alerts →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              tab === "returns" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => setTab("returns")}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Return stock
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {stats.returnUnits.toLocaleString()}
+              </span>
+              {stats.returnValue > 0 && (
+                <span className="rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-800">
+                  {shortKes(stats.returnValue)}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {stats.returnCount} return SKU{stats.returnCount === 1 ? "" : "s"}
+            </p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              View returns →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              tab === "categories" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => setTab("categories")}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Categories
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {stats.categories}
+              </span>
+            </div>
+            {stats.uncategorized > 0 ? (
+              <p className="mt-1.5 inline-flex items-center self-start rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                {stats.uncategorized} uncategorized
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-slate-500">All products categorized</p>
+            )}
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              Manage categories →
+            </span>
           </button>
         </div>
-      )}
+      </section>
 
-      <div className="sf-card overflow-hidden p-0">
-        <div className="flex flex-wrap items-center gap-1 border-b border-slate-200 bg-slate-50/80 p-1.5">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={`rounded-lg px-3 py-2 text-sm transition ${
-                tab === t.id
-                  ? "bg-white font-semibold text-[var(--sf-brand)] shadow-sm ring-1 ring-slate-200"
-                  : "text-slate-600 hover:bg-white/70"
-              }`}
-            >
-              {t.label}
-              <span className="ml-1.5 text-xs text-slate-400">{t.count}</span>
-            </button>
-          ))}
+      <section
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+        aria-label="Inventory records"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 pt-2.5 sm:px-4">
+          <div role="tablist" aria-label="Inventory records" className="inline-flex rounded-md bg-indigo-50 p-0.5">
+            {(
+              [
+                ["products", "Products", sellable.length],
+                ["returns", "Return SKUs", returnSkus.length],
+                ["categories", "Categories", categories.length],
+              ] as const
+            ).map(([key, label, count]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={tab === key}
+                className={`h-7 rounded-md px-2.5 text-xs transition ${
+                  tab === key
+                    ? "bg-indigo-600 font-semibold text-white shadow-sm"
+                    : "font-medium text-slate-600 hover:text-slate-900"
+                }`}
+                onClick={() => setTab(key)}
+              >
+                {label}{" "}
+                <span className={tab === key ? "ml-1 font-medium text-indigo-200" : "ml-1 text-slate-500"}>
+                  {count}
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
 
-        {tab === "products" && (
-          <div className="border-b border-slate-100 px-4 pt-4">
-            <h3 className="text-base font-semibold text-[var(--sf-brand)]">Products</h3>
-            <p className="mt-0.5 text-sm text-slate-500">
-              Your inventory list. Sort, filter, and manage products. Add categories in their tab
-              first.
-            </p>
-          </div>
-        )}
-
         {tab !== "categories" && (
-          <div className="flex flex-wrap items-end gap-2 border-b border-slate-100 px-3 py-3">
-            {tab === "products" && (
-              <>
-                <label className="text-xs font-medium text-slate-500">
-                  Category
-                  <select
-                    className="sf-select mt-1 w-auto min-w-[140px]"
-                    value={categoryId}
-                    onChange={(e) => setCategoryId(e.target.value)}
-                  >
-                    <option value="">All</option>
-                    {categories.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="text-xs font-medium text-slate-500">
-                  Status
-                  <select
-                    className="sf-select mt-1 w-auto min-w-[130px]"
-                    value={status}
-                    onChange={(e) => setStatus(e.target.value as StatusFilter)}
-                  >
-                    <option value="all">All</option>
-                    <option value="in_stock">In stock</option>
-                    <option value="low">Below reorder</option>
-                    <option value="out">Out of stock</option>
-                  </select>
-                </label>
-                <label className="text-xs font-medium text-slate-500">
-                  Show
-                  <select
-                    className="sf-select mt-1 w-auto min-w-[72px]"
-                    value={pageSize}
-                    onChange={(e) => setPageSize(Number(e.target.value))}
-                  >
-                    <option value={25}>25</option>
-                    <option value={50}>50</option>
-                    <option value={100}>100</option>
-                  </select>
-                </label>
-              </>
-            )}
-            <label className="min-w-[200px] flex-1 text-xs font-medium text-slate-500">
-              Search
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2 sm:px-4">
+            <label className="relative min-w-[160px] flex-1 sm:max-w-xs">
+              <span className="sr-only">Search inventory</span>
               <input
-                className="sf-input mt-1"
+                type="search"
                 placeholder={
                   tab === "returns"
                     ? "Search return SKU or parent product"
-                    : "Name, SKU, or barcode"
+                    : "Search name, SKU, barcode…"
                 }
+                className="h-8 w-full rounded-lg border-0 bg-white px-2.5 text-xs ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
               />
             </label>
             {tab === "products" && (
               <>
-                <button
-                  type="button"
-                  className={`sf-btn ${
-                    status === "low" ? "sf-btn-accent" : "sf-btn-ghost"
-                  }`}
-                  onClick={() => setStatus(status === "low" ? "all" : "low")}
+                <select
+                  className="h-8 min-w-[130px] appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                  value={categoryId}
+                  onChange={(e) => setCategoryId(e.target.value)}
+                  aria-label="Category"
                 >
-                  Below reorder only
-                </button>
-                <button type="button" className="sf-btn sf-btn-ghost" onClick={exportCsv}>
-                  Export CSV
-                </button>
+                  <option value="">All categories</option>
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="h-8 min-w-[120px] appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                  value={status}
+                  onChange={(e) => setStatus(e.target.value as StatusFilter)}
+                  aria-label="Status"
+                >
+                  <option value="all">All status</option>
+                  <option value="in_stock">In stock</option>
+                  <option value="low">Below reorder</option>
+                  <option value="out">Out of stock</option>
+                </select>
                 <div className="relative" ref={columnsRef}>
                   <button
                     type="button"
-                    className="sf-btn sf-btn-ghost"
+                    className={ghostBtn}
                     onClick={() => setShowColumns((v) => !v)}
                     aria-expanded={showColumns}
                   >
@@ -783,222 +1011,231 @@ export default function InventoryPage() {
         ) : tab === "products" ? (
           <>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[720px] text-sm">
-                <thead className="sf-thead">
-                  <tr>
-                    {col("photo") && <th className="px-3 py-2.5 w-14">Photo</th>}
-                    <th className="px-3 py-2.5">Name</th>
-                    {col("sku") && <th className="px-3 py-2.5">SKU</th>}
-                    {col("barcode") && <th className="px-3 py-2.5">Barcode</th>}
-                    {col("category") && <th className="px-3 py-2.5">Category</th>}
-                    {col("cost") && <th className="px-3 py-2.5">Cost (KSh)</th>}
-                    {col("sell") && <th className="px-3 py-2.5">Sell (KSh)</th>}
-                    {col("margin") && <th className="px-3 py-2.5">Margin</th>}
-                    {col("qty") && <th className="px-3 py-2.5">Qty</th>}
-                    {col("reorder") && <th className="px-3 py-2.5">Reorder</th>}
-                    {col("returns") && <th className="px-3 py-2.5">Returns</th>}
-                    {col("cog") && <th className="px-3 py-2.5">Stock value</th>}
-                    {col("alert") && <th className="px-3 py-2.5">Alert</th>}
-                    {canEdit && <th className="px-3 py-2.5">Actions</th>}
+              <table className="w-full min-w-[880px] text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100">
+                    <th className="px-4 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                      Product
+                    </th>
+                    {col("identifiers") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Identifiers
+                      </th>
+                    )}
+                    {col("category") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Category / Unit
+                      </th>
+                    )}
+                    {col("pricing") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Cost → Sell
+                      </th>
+                    )}
+                    {col("margin") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Margin
+                      </th>
+                    )}
+                    {col("qty") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        {branchName}
+                      </th>
+                    )}
+                    {col("returns") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Returns
+                      </th>
+                    )}
+                    {col("cog") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Stock value
+                      </th>
+                    )}
+                    {col("alert") && (
+                      <th className="px-3 py-2.5 text-start text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Status
+                      </th>
+                    )}
+                    {canEdit && (
+                      <th className="px-3 py-2.5 text-end text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        Product Actions
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {pagedProducts.map((p) => {
-                    const low = p.qty <= p.reorderLevel;
-                    const out = p.qty <= 0;
+                    const statusPill = stockStatus(p.qty, p.reorderLevel);
                     const margin = marginPercent(p.cost, p.sellPrice);
+                    const markup = markupPercent(p.cost, p.sellPrice);
                     const returnQty =
                       p.returnSkus?.reduce((s, r) => s + r.qty, 0) || p.openedQty || 0;
+                    const outOfStock = p.qty <= 0;
+                    const orderHref =
+                      outOfStock && canPurchase
+                        ? `/purchasing?productId=${encodeURIComponent(p.id)}&compose=po`
+                        : null;
                     return (
-                      <tr key={p.id} className="sf-row">
-                        {col("photo") && (
-                          <td className="px-3 py-2.5">
-                            {p.imageUrl ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img
-                                src={p.imageUrl}
-                                alt=""
-                                className="h-10 w-10 rounded-lg object-cover ring-1 ring-slate-200"
-                              />
-                            ) : (
-                              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100 text-xs text-slate-400">
-                                -
+                      <tr
+                        key={p.id}
+                        className={`border-b border-slate-50 hover:bg-slate-50/70 ${
+                          orderHref ? "cursor-pointer" : ""
+                        }`}
+                        title={orderHref ? "Out of stock — click to create a purchase order" : undefined}
+                        onClick={
+                          orderHref
+                            ? () => router.push(orderHref)
+                            : undefined
+                        }
+                      >
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-3">
+                            {col("photo") ? (
+                              p.imageUrl ? (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img
+                                  src={p.imageUrl}
+                                  alt=""
+                                  className="h-9 w-9 rounded-full object-cover ring-1 ring-slate-200"
+                                />
+                              ) : (
+                                <div
+                                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(p.id)}`}
+                                >
+                                  {initials(p.name)}
+                                </div>
+                              )
+                            ) : null}
+                            <div className="min-w-0">
+                              <div className="truncate font-semibold text-[var(--sf-brand)]">
+                                {p.name}
                               </div>
-                            )}
-                          </td>
-                        )}
-                        <td className="px-3 py-2.5">
-                          <div className="font-medium text-[var(--sf-brand)]">{p.name}</div>
-                          <div className="mt-0.5 flex flex-wrap gap-1">
-                            {p.trackSerial && (
-                              <span className="sf-badge bg-slate-100 text-slate-600">Serial</span>
-                            )}
-                            {!p.barcode && (
-                              <span className="sf-badge bg-amber-50 text-amber-800">No barcode</span>
-                            )}
+                              {p.trackSerial && (
+                                <span className="mt-0.5 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-600">
+                                  Serial
+                                </span>
+                              )}
+                            </div>
                           </div>
                         </td>
-                        {col("sku") && (
-                          <td className="px-3 py-2.5 font-mono text-xs">{p.sku}</td>
-                        )}
-                        {col("barcode") && (
-                          <td className="px-3 py-2.5 font-mono text-xs text-slate-600">
-                            {p.barcode || "-"}
+                        {col("identifiers") && (
+                          <td className="px-3 py-3 font-mono text-xs">
+                            <div className="font-semibold text-slate-800">{p.sku}</div>
+                            <div className="mt-0.5 text-slate-500">{p.barcode || "—"}</div>
                           </td>
                         )}
                         {col("category") && (
-                          <td className="px-3 py-2.5 text-slate-600">
-                            {p.category?.name || (
-                              <span className="text-amber-700">Uncategorized</span>
-                            )}
+                          <td className="px-3 py-3 text-slate-600">
+                            <div>{p.category?.name || "Uncategorized"}</div>
+                            <div className="mt-0.5 text-xs text-slate-400">per {p.unit}</div>
                           </td>
                         )}
-                        {col("cost") && (
-                          <td className="px-3 py-2.5 tabular-nums">{formatKes(p.cost)}</td>
-                        )}
-                        {col("sell") && (
-                          <td className="px-3 py-2.5 tabular-nums">
-                            {formatKes(p.sellPrice)}
-                            <span className="text-slate-400">/{p.unit}</span>
+                        {col("pricing") && (
+                          <td className="px-3 py-3 tabular-nums">
+                            <div className="text-slate-400">{formatKes(p.cost)}</div>
+                            <div className="mt-0.5 font-semibold text-slate-900">
+                              {formatKes(p.sellPrice)}
+                            </div>
                           </td>
                         )}
                         {col("margin") && (
-                          <td className="px-3 py-2.5 tabular-nums">{margin.toFixed(1)}%</td>
-                        )}
-                        {col("qty") && (
-                          <td className="px-3 py-2.5">
-                            {qtyEditId === p.id ? (
-                              <div className="flex items-center gap-1">
-                                <input
-                                  type="number"
-                                  min={0}
-                                  step="0.01"
-                                  className="sf-input w-20 px-2 py-1"
-                                  value={qtyDraft}
-                                  autoFocus
-                                  disabled={qtySaving}
-                                  onChange={(e) => setQtyDraft(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") confirmQtyEdit(p);
-                                    if (e.key === "Escape") setQtyEditId(null);
-                                  }}
-                                />
-                                <button
-                                  type="button"
-                                  className="rounded-md bg-emerald-600 px-2 py-1 text-xs font-medium text-white"
-                                  disabled={qtySaving}
-                                  onClick={() => confirmQtyEdit(p)}
-                                >
-                                  OK
-                                </button>
-                                <button
-                                  type="button"
-                                  className="rounded-md bg-slate-200 px-2 py-1 text-xs font-medium text-slate-700"
-                                  disabled={qtySaving}
-                                  onClick={() => setQtyEditId(null)}
-                                >
-                                  x
-                                </button>
-                              </div>
-                            ) : (
-                              <button
-                                type="button"
-                                className={`tabular-nums font-medium ${
-                                  canEdit
-                                    ? "rounded-md px-1.5 py-0.5 hover:bg-slate-100 hover:ring-1 hover:ring-slate-200"
-                                    : ""
-                                }`}
-                                onClick={() => startQtyEdit(p)}
-                                title={canEdit ? "Click to adjust stock" : undefined}
-                                disabled={!canEdit}
-                              >
-                                {p.qty} {p.unit}
-                              </button>
-                            )}
+                          <td className="px-3 py-3 tabular-nums">
+                            <div
+                              className={`font-semibold ${
+                                margin < 15 ? "text-amber-700" : "text-emerald-700"
+                              }`}
+                            >
+                              {margin.toFixed(1)}%
+                            </div>
+                            <div className="mt-0.5 text-xs text-slate-400">
+                              {markup.toFixed(0)}% markup
+                            </div>
                           </td>
                         )}
-                        {col("reorder") && (
-                          <td className="px-3 py-2.5 tabular-nums text-slate-600">
-                            {p.reorderLevel}
+                        {col("qty") && (
+                          <td className="px-3 py-3">
+                            <div
+                              className={`font-semibold tabular-nums ${
+                                p.qty <= p.reorderLevel ? "text-rose-700" : "text-slate-900"
+                              }`}
+                            >
+                              {p.qty} {p.unit}
+                            </div>
+                            <div className="mt-0.5 text-xs text-slate-400">
+                              reorder {p.reorderLevel}
+                            </div>
                           </td>
                         )}
                         {col("returns") && (
-                          <td className="px-3 py-2.5">
+                          <td className="px-3 py-3">
                             {returnQty > 0 ? (
                               <span className="sf-badge bg-amber-100 text-amber-900">
                                 {returnQty} {p.unit}
                               </span>
                             ) : (
-                              <span className="text-slate-400">-</span>
+                              <span className="text-slate-400">—</span>
                             )}
                           </td>
                         )}
                         {col("cog") && (
-                          <td className="px-3 py-2.5 tabular-nums">
-                            {formatKes(p.cost * p.qty)}
-                          </td>
+                          <td className="px-3 py-3 tabular-nums">{formatKes(p.cost * p.qty)}</td>
                         )}
                         {col("alert") && (
-                          <td className="px-3 py-2.5">
+                          <td className="px-3 py-3">
                             <span
-                              className={`sf-badge ${
-                                out
-                                  ? "bg-rose-100 text-rose-800"
-                                  : low
-                                    ? "bg-amber-100 text-amber-800"
-                                    : "bg-emerald-100 text-emerald-800"
-                              }`}
+                              className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide ${statusPill.tone}`}
                             >
-                              {out ? "Out of stock" : low ? "Low stock" : "In stock"}
+                              {statusPill.label}
+                              {orderHref ? (
+                                <span className="font-bold opacity-80">· Order</span>
+                              ) : null}
                             </span>
                           </td>
                         )}
                         {canEdit && (
-                          <td className="px-3 py-2.5">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Link
-                                href="/pos"
-                                className="sf-link text-xs"
-                                title="Sell on POS"
-                              >
-                                Sell
-                              </Link>
+                          <td className="px-3 py-3" onClick={(e) => e.stopPropagation()}>
+                            <div className="flex flex-nowrap items-center justify-end gap-1.5 whitespace-nowrap">
                               <button
                                 type="button"
-                                className="sf-link text-xs"
+                                title="Edit product"
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-orange-200 bg-white px-3 py-2 text-xs font-bold text-[var(--sf-accent-deep)] shadow-sm hover:bg-[var(--sf-accent-soft)]"
                                 onClick={() => openEdit(p)}
                               >
+                                <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                                </svg>
                                 Edit
                               </button>
                               {returnQty > 0 && (
                                 <>
                                   <button
                                     type="button"
-                                    className="text-xs font-medium text-teal-700 hover:underline"
+                                    title="Release return stock"
+                                    className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200 bg-white px-3 py-2 text-xs font-bold text-amber-800 shadow-sm hover:bg-amber-50"
                                     onClick={() => quarantineAction(p, "releaseOpened")}
                                   >
                                     Release
                                   </button>
                                   <button
                                     type="button"
-                                    className="text-xs font-medium text-amber-700 hover:underline"
+                                    title="Write off return stock"
+                                    className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200 bg-white px-3 py-2 text-xs font-bold text-amber-800 shadow-sm hover:bg-amber-50"
                                     onClick={() => quarantineAction(p, "writeOffOpened")}
                                   >
                                     Write off
                                   </button>
                                 </>
                               )}
-                              <Link
-                                href="/purchasing"
-                                className="text-xs font-medium text-slate-600 hover:underline"
-                              >
-                                Purchase
-                              </Link>
                               <button
                                 type="button"
-                                className="text-xs font-medium text-rose-600 hover:underline"
-                                onClick={() => remove(p.id)}
+                                title="Delete product"
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white px-3 py-2 text-xs font-bold text-rose-600 shadow-sm hover:bg-rose-50"
+                                onClick={() => setDeactivateTarget(p)}
                               >
+                                <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3m-7 0h8" />
+                                </svg>
                                 Delete
                               </button>
                             </div>
@@ -1011,7 +1248,7 @@ export default function InventoryPage() {
                     <tr>
                       <td
                         colSpan={visibleColCount}
-                        className="px-3 py-10 text-center text-slate-500"
+                        className="px-4 py-10 text-center text-slate-500"
                       >
                         No products match these filters
                       </td>
@@ -1020,12 +1257,28 @@ export default function InventoryPage() {
                 </tbody>
               </table>
             </div>
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-4 py-3 text-sm text-slate-600">
-              <span>
-                {filteredProducts.length
-                  ? `Showing ${pageStart} - ${pageEnd} of ${filteredProducts.length}`
-                  : "Showing 0 of 0"}
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-sm text-slate-600">
+              <div className="flex flex-wrap items-center gap-3">
+                <span>
+                  {filteredProducts.length
+                    ? `Showing ${pageStart} - ${pageEnd} of ${filteredProducts.length}`
+                    : "Showing 0 of 0"}
+                </span>
+                <label className="inline-flex items-center gap-2 text-slate-500">
+                  <span>Per page</span>
+                  <select
+                    className="h-8 appearance-none rounded-lg border-0 bg-white py-0 pl-2.5 pr-8 text-xs text-slate-700 ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-slate-900"
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    aria-label="Rows per page"
+                  >
+                    <option value={10}>10</option>
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                  </select>
+                </label>
+              </div>
               <div className="flex gap-2">
                 <button
                   type="button"
@@ -1055,7 +1308,9 @@ export default function InventoryPage() {
                   <th className="px-3 py-2.5">Parent product</th>
                   <th className="px-3 py-2.5">Qty</th>
                   <th className="px-3 py-2.5">Sell price</th>
-                  <th className="px-3 py-2.5">Actions</th>
+                  <th className="px-3 py-2.5 text-end text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                    Product Actions
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -1079,13 +1334,19 @@ export default function InventoryPage() {
                     <td className="px-3 py-2.5 tabular-nums">{formatKes(p.sellPrice)}</td>
                     <td className="px-3 py-2.5">
                       {canEdit && (
-                        <button
-                          type="button"
-                          className="sf-link text-xs"
-                          onClick={() => openEdit(p)}
-                        >
-                          Edit price
-                        </button>
+                        <div className="flex justify-end">
+                          <button
+                            type="button"
+                            title="Edit price"
+                            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl border border-orange-200 bg-white px-3 py-2 text-xs font-bold text-[var(--sf-accent-deep)] shadow-sm hover:bg-[var(--sf-accent-soft)]"
+                            onClick={() => openEdit(p)}
+                          >
+                            <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                            </svg>
+                            Edit price
+                          </button>
+                        </div>
                       )}
                     </td>
                   </tr>
@@ -1101,61 +1362,105 @@ export default function InventoryPage() {
             </table>
           </div>
         ) : (
-          <div className="space-y-4 p-4">
-            {canEdit && (
-              <form onSubmit={addCategory} className="flex flex-wrap gap-2">
-                <input
-                  className="sf-input max-w-xs flex-1"
-                  placeholder="New category name"
-                  value={newCategory}
-                  onChange={(e) => setNewCategory(e.target.value)}
-                />
-                <button type="submit" className="sf-btn sf-btn-primary">
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5 sm:px-4">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-900">Categories</p>
+                <p className="text-[11px] text-slate-500">
+                  {categories.length
+                    ? `${categories.length} categor${categories.length === 1 ? "y" : "ies"} for product grouping`
+                    : "Group products for faster POS and reports"}
+                </p>
+              </div>
+              {canEdit ? (
+                <button type="button" className={primaryBtn} onClick={openAddCategory}>
                   + Add category
                 </button>
-              </form>
-            )}
-            <div className="overflow-x-auto rounded-xl border border-slate-200">
-              <table className="w-full text-sm">
-                <thead className="sf-thead">
-                  <tr>
-                    <th className="px-3 py-2.5">Category</th>
-                    <th className="px-3 py-2.5">Products</th>
-                    <th className="px-3 py-2.5"></th>
+              ) : null}
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[560px] text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                    <th className="px-3 py-2.5 sm:px-4">Category</th>
+                    <th className="px-3 py-2.5 sm:px-4">Products</th>
+                    <th className="px-3 py-2.5 text-right sm:px-4">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {categoryRows.map((c) => (
-                    <tr key={c.id} className="sf-row">
-                      <td className="px-3 py-2.5 font-medium">{c.name}</td>
-                      <td className="px-3 py-2.5 tabular-nums">{c.productCount}</td>
-                      <td className="px-3 py-2.5 text-right">
-                        <button
-                          type="button"
-                          className="sf-link text-xs"
-                          onClick={() => {
-                            setTab("products");
-                            setCategoryId(c.id);
-                          }}
-                        >
-                          View products
-                        </button>
+                    <tr
+                      key={c.id}
+                      className="border-b border-slate-100 last:border-0 hover:bg-slate-50/60"
+                    >
+                      <td className="px-3 py-2.5 font-medium text-slate-900 sm:px-4">{c.name}</td>
+                      <td className="px-3 py-2.5 tabular-nums text-slate-600 sm:px-4">
+                        {c.productCount}
+                      </td>
+                      <td className="px-3 py-2.5 text-right sm:px-4">
+                        {canEdit ? (
+                          <div className="flex flex-nowrap items-center justify-end gap-1.5 whitespace-nowrap">
+                            <button
+                              type="button"
+                              title="Edit category"
+                              className="inline-flex items-center gap-1.5 rounded-xl border border-orange-200 bg-white px-3 py-2 text-xs font-bold text-[var(--sf-accent-deep)] shadow-sm hover:bg-[var(--sf-accent-soft)]"
+                              onClick={() => openEditCategory(c)}
+                            >
+                              <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                              </svg>
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              title="Delete category"
+                              className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white px-3 py-2 text-xs font-bold text-rose-600 shadow-sm hover:bg-rose-50"
+                              onClick={() =>
+                                setDeleteCategoryTarget({
+                                  id: c.id,
+                                  name: c.name,
+                                  productCount: c.productCount,
+                                })
+                              }
+                            >
+                              <svg className="size-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3m-7 0h8" />
+                              </svg>
+                              Delete
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
+                        )}
                       </td>
                     </tr>
                   ))}
                   {!categoryRows.length && (
                     <tr>
-                      <td colSpan={3} className="px-3 py-8 text-center text-slate-500">
-                        No categories yet
+                      <td colSpan={3} className="px-4 py-12 text-center">
+                        <p className="text-sm font-medium text-slate-700">No categories yet</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Add groups like Cement, Fasteners, or Tools to organize stock.
+                        </p>
+                        {canEdit ? (
+                          <button
+                            type="button"
+                            className={`${primaryBtn} mt-3`}
+                            onClick={openAddCategory}
+                          >
+                            + Add category
+                          </button>
+                        ) : null}
                       </td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </div>
-          </div>
+          </>
         )}
-      </div>
+      </section>
 
       {showForm && (
         <div className="sf-modal-backdrop">
@@ -1297,21 +1602,24 @@ export default function InventoryPage() {
                         placeholder={editing ? undefined : "Auto-generated if left blank"}
                       />
                     </label>
-                    <label className="block text-sm sm:col-span-2">
-                      Category
-                      <select
-                        className="sf-select mt-1"
+                    <div className="block text-sm sm:col-span-2">
+                      <span className="block">Category</span>
+                      <SelectMenu
+                        className="mt-1"
                         value={form.categoryId}
-                        onChange={(e) => setForm({ ...form, categoryId: e.target.value })}
-                      >
-                        <option value="">Select category</option>
-                        {categories.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                        onChange={(v) => setForm({ ...form, categoryId: v })}
+                        placeholder="Select category"
+                        searchable
+                        searchPlaceholder="Search categories…"
+                        triggerClassName="sf-select flex w-full items-center justify-between gap-2 text-left"
+                        options={[
+                          { value: "", label: "Select category" },
+                          ...categories.map((c) => ({ value: c.id, label: c.name })),
+                        ]}
+                        actionLabel={canEdit ? "Add category" : undefined}
+                        onAction={canEdit ? openAddCategory : undefined}
+                      />
+                    </div>
                     <label className="block text-sm sm:col-span-2">
                       Barcode (optional)
                       <input
@@ -1427,6 +1735,113 @@ export default function InventoryPage() {
           </form>
         </div>
       )}
+
+      {canEdit && showCategoryForm ? (
+        <div className="sf-modal-backdrop">
+          <form onSubmit={saveCategory} className="sf-modal max-w-md">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold tracking-tight text-slate-900">
+                  {editingCategory ? "Edit category" : "Add category"}
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  {editingCategory
+                    ? "Rename this category. Products stay linked."
+                    : "Name a group for products at POS and in reports."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                aria-label="Close"
+                disabled={savingCategory}
+                onClick={closeCategoryForm}
+              >
+                ×
+              </button>
+            </div>
+            <label className="mt-4 block text-xs font-medium text-slate-500">
+              Name
+              <input
+                type="text"
+                autoFocus
+                required
+                placeholder="e.g. Fasteners"
+                className="mt-1.5 h-10 w-full rounded-lg border-0 bg-white px-3 text-sm text-slate-900 ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-slate-900"
+                value={newCategory}
+                onChange={(e) => {
+                  setNewCategory(e.target.value);
+                  if (categoryError) setCategoryError("");
+                }}
+                disabled={savingCategory}
+              />
+            </label>
+            {categoryError ? (
+              <p className="mt-2 text-xs font-medium text-rose-600">{categoryError}</p>
+            ) : null}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                className={ghostBtn}
+                disabled={savingCategory}
+                onClick={closeCategoryForm}
+              >
+                Cancel
+              </button>
+              <button type="submit" className={primaryBtn} disabled={savingCategory}>
+                {savingCategory
+                  ? "Saving…"
+                  : editingCategory
+                    ? "Save changes"
+                    : "Add category"}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      <ConfirmDialog
+        open={Boolean(deactivateTarget)}
+        title={`Deactivate ${deactivateTarget?.name || "product"}?`}
+        message="It will be hidden from POS and purchasing. Existing sales history stays on file."
+        confirmLabel="Deactivate"
+        tone="danger"
+        loading={deactivateBusy}
+        onCancel={() => {
+          if (!deactivateBusy) setDeactivateTarget(null);
+        }}
+        onConfirm={confirmDeactivate}
+      />
+
+      <ConfirmDialog
+        open={Boolean(notice)}
+        title={notice?.title || ""}
+        message={notice?.message || ""}
+        confirmLabel="OK"
+        hideCancel
+        tone="danger"
+        onCancel={() => setNotice(null)}
+        onConfirm={() => setNotice(null)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deleteCategoryTarget)}
+        title={`Delete ${deleteCategoryTarget?.name || "category"}?`}
+        message={
+          deleteCategoryTarget && deleteCategoryTarget.productCount > 0
+            ? `${deleteCategoryTarget.productCount} product${
+                deleteCategoryTarget.productCount === 1 ? "" : "s"
+              } will become Uncategorized. This cannot be undone.`
+            : "This category has no products. It will be removed permanently."
+        }
+        confirmLabel="Delete"
+        tone="danger"
+        loading={deleteCategoryBusy}
+        onCancel={() => {
+          if (!deleteCategoryBusy) setDeleteCategoryTarget(null);
+        }}
+        onConfirm={confirmDeleteCategory}
+      />
     </div>
   );
 }

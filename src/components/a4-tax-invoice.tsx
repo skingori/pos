@@ -16,10 +16,13 @@ export function A4TaxInvoice({
   openBalance?: number;
 }) {
   const when = data.completedAt ? new Date(data.completedAt) : new Date();
+  const showVat = (data.taxAmount || 0) > 0.009 && (data.taxRate || 0) > 0;
   const exclVat =
-    typeof data.subtotal === "number" && (data.taxAmount || 0) > 0
+    showVat && typeof data.subtotal === "number"
       ? Math.max(0, data.subtotal - (data.taxAmount || 0))
-      : data.subtotal;
+      : null;
+  const plainSubtotal =
+    !showVat && typeof data.subtotal === "number" ? data.subtotal : null;
   const collected = (data.payments || [])
     .filter((p) => p.method !== "CREDIT")
     .reduce((s, p) => s + p.amount, 0);
@@ -156,6 +159,14 @@ export function A4TaxInvoice({
             </span>
           </div>
         ) : null}
+        {plainSubtotal != null && (data.discount || 0) > 0.009 ? (
+          <div className="a4-total-row flex items-baseline justify-between gap-3 py-0.5 tabular-nums">
+            <span className="shrink-0 text-[var(--sf-muted)]">Subtotal</span>
+            <span className="min-w-0 truncate text-right font-mono" title={formatKes(plainSubtotal)}>
+              {formatKes(plainSubtotal)}
+            </span>
+          </div>
+        ) : null}
         {(data.discount || 0) > 0 ? (
           <div className="a4-total-row flex items-baseline justify-between gap-3 py-0.5 tabular-nums">
             <span className="shrink-0 text-[var(--sf-muted)]">Discount</span>
@@ -164,7 +175,7 @@ export function A4TaxInvoice({
             </span>
           </div>
         ) : null}
-        {(data.taxAmount || 0) > 0 ? (
+        {showVat ? (
           <div className="a4-total-row flex items-baseline justify-between gap-3 py-0.5 tabular-nums">
             <span className="shrink-0 text-[var(--sf-muted)]">VAT ({data.taxRate}%)</span>
             <span className="min-w-0 truncate text-right font-mono" title={formatKes(data.taxAmount || 0)}>

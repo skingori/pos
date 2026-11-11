@@ -30,7 +30,7 @@ export default async function DashboardLayout({
         open
           ? {
               branchName: branch.name,
-              openedAtLabel: format(open.createdAt, "d MMM"),
+              openedAtLabel: format(open.createdAt, "h:mm a"),
               openedBy: open.openedBy.name,
               openingFloat: open.openingFloat,
             }

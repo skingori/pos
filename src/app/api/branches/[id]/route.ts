@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageBranches } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { MAIN_BRANCH_CODE } from "@/lib/branch";
 
@@ -11,7 +11,7 @@ export async function PATCH(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageBranches(user.role)) return forbidden();
+  if (!hasPermission(user, "branches.manage")) return forbidden();
 
   const { id } = await params;
   const existing = await prisma.branch.findUnique({ where: { id } });
@@ -88,7 +88,7 @@ export async function DELETE(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageBranches(user.role)) return forbidden();
+  if (!hasPermission(user, "branches.manage")) return forbidden();
 
   const { id } = await params;
   const existing = await prisma.branch.findUnique({
@@ -100,9 +100,6 @@ export async function DELETE(
   if (!existing) return NextResponse.json({ error: "Not found" }, { status: 404 });
   if (existing.code === MAIN_BRANCH_CODE) {
     return NextResponse.json({ error: "Cannot delete Main branch" }, { status: 400 });
-  }
-  if (existing.active) {
-    return NextResponse.json({ error: "Deactivate the branch first" }, { status: 400 });
   }
   const stockWithQty = await prisma.branchStock.count({
     where: {

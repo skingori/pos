@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { resolveBranchId } from "@/lib/branch";
 import { setStock } from "@/lib/branch-stock";
@@ -49,10 +49,48 @@ function splitCsvLine(line: string) {
   return out;
 }
 
+/** Match existing category (case-insensitive) or create it — CSV is not limited to known names. */
+async function ensureCategoryId(
+  rawName: string,
+  byName: Record<string, string>
+): Promise<{ id: string; created: boolean }> {
+  const name = rawName.trim().replace(/\s+/g, " ");
+  const key = name.toLowerCase();
+  if (!key) throw new Error("Category name is empty");
+
+  const cached = byName[key];
+  if (cached) return { id: cached, created: false };
+
+  const existing = await prisma.category.findFirst({
+    where: { name: { equals: name, mode: "insensitive" } },
+  });
+  if (existing) {
+    byName[key] = existing.id;
+    byName[existing.name.toLowerCase()] = existing.id;
+    return { id: existing.id, created: false };
+  }
+
+  try {
+    const created = await prisma.category.create({ data: { name } });
+    byName[key] = created.id;
+    return { id: created.id, created: true };
+  } catch {
+    const again = await prisma.category.findFirst({
+      where: { name: { equals: name, mode: "insensitive" } },
+    });
+    if (again) {
+      byName[key] = again.id;
+      byName[again.name.toLowerCase()] = again.id;
+      return { id: again.id, created: false };
+    }
+    throw new Error(`Could not create category "${name}"`);
+  }
+}
+
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "inventory.manage")) return forbidden();
 
   const branchId = await resolveBranchId(user);
   const contentType = req.headers.get("content-type") || "";
@@ -78,58 +116,63 @@ export async function POST(req: NextRequest) {
 
   let created = 0;
   let updated = 0;
+  let categoriesCreated = 0;
   const errors: string[] = [];
 
   for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const name = row.name || row.product || "";
-    const sku = row.sku || "";
-    if (!name || !sku) {
-      errors.push(`Row ${i + 2}: name and sku are required`);
-      continue;
-    }
-    const cost = Number(row.cost ?? row.buying ?? row.buying_price ?? 0);
-    const sellPrice = Number(row.sellprice ?? row.sell_price ?? row.sell ?? 0);
-    if (!Number.isFinite(cost) || cost < 0 || !Number.isFinite(sellPrice) || sellPrice <= 0) {
-      errors.push(`Row ${i + 2}: valid cost and sell price required`);
-      continue;
-    }
-
-    let categoryId: string | null = null;
-    const catName = row.category || row.category_name || "";
-    if (catName) {
-      categoryId = byName[catName.toLowerCase()] || null;
-      if (!categoryId) {
-        const createdCat = await prisma.category.create({ data: { name: catName } });
-        categoryId = createdCat.id;
-        byName[catName.toLowerCase()] = createdCat.id;
+    const rowNum = i + 2;
+    try {
+      const row = rows[i];
+      const name = row.name || row.product || "";
+      const sku = row.sku || "";
+      if (!name || !sku) {
+        errors.push(`Row ${rowNum}: name and sku are required`);
+        continue;
       }
-    }
+      const cost = Number(row.cost ?? row.buying ?? row.buying_price ?? 0);
+      const sellPrice = Number(row.sellprice ?? row.sell_price ?? row.sell ?? 0);
+      if (!Number.isFinite(cost) || cost < 0 || !Number.isFinite(sellPrice) || sellPrice <= 0) {
+        errors.push(`Row ${rowNum}: valid cost and sell price required`);
+        continue;
+      }
 
-    const qty = Number(row.qty ?? row.quantity ?? 0) || 0;
-    const reorderLevel = Number(row.reorder ?? row.reorder_level ?? 0) || 0;
-    const data = {
-      name,
-      barcode: row.barcode || null,
-      categoryId,
-      cost,
-      sellPrice,
-      unit: row.unit || "pc",
-      trackSerial: ["1", "true", "yes"].includes(
-        (row.trackserial || row.track_serial || "").toLowerCase()
-      ),
-      active: true,
-    };
+      let categoryId: string | null = null;
+      const catName = row.category || row.category_name || "";
+      if (catName.trim()) {
+        const resolved = await ensureCategoryId(catName, byName);
+        categoryId = resolved.id;
+        if (resolved.created) categoriesCreated++;
+      }
 
-    const existing = await prisma.product.findUnique({ where: { sku } });
-    if (existing) {
-      await prisma.product.update({ where: { id: existing.id }, data });
-      await setStock(prisma, branchId, existing.id, { qty, reorderLevel });
-      updated++;
-    } else {
-      const createdProduct = await prisma.product.create({ data: { ...data, sku } });
-      await setStock(prisma, branchId, createdProduct.id, { qty, reorderLevel });
-      created++;
+      const qty = Number(row.qty ?? row.quantity ?? 0) || 0;
+      const reorderLevel = Number(row.reorder ?? row.reorder_level ?? 0) || 0;
+      const data = {
+        name,
+        barcode: row.barcode || null,
+        categoryId,
+        cost,
+        sellPrice,
+        unit: row.unit || "pc",
+        trackSerial: ["1", "true", "yes"].includes(
+          (row.trackserial || row.track_serial || "").toLowerCase()
+        ),
+        active: true,
+      };
+
+      const existing = await prisma.product.findUnique({ where: { sku } });
+      if (existing) {
+        await prisma.product.update({ where: { id: existing.id }, data });
+        await setStock(prisma, branchId, existing.id, { qty, reorderLevel });
+        updated++;
+      } else {
+        const createdProduct = await prisma.product.create({ data: { ...data, sku } });
+        await setStock(prisma, branchId, createdProduct.id, { qty, reorderLevel });
+        created++;
+      }
+    } catch (e) {
+      errors.push(
+        `Row ${rowNum}: ${e instanceof Error ? e.message : "Could not import this row"}`
+      );
     }
   }
 
@@ -137,12 +180,13 @@ export async function POST(req: NextRequest) {
     userId: user.id,
     action: "IMPORT",
     entity: "Product",
-    detail: `created ${created}, updated ${updated}, errors ${errors.length}, branch ${branchId}`,
+    detail: `created ${created}, updated ${updated}, categoriesCreated ${categoriesCreated}, errors ${errors.length}, branch ${branchId}`,
   });
 
   return NextResponse.json({
     created,
     updated,
+    categoriesCreated,
     errors: errors.slice(0, 20),
     errorCount: errors.length,
   });

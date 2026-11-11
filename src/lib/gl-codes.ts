@@ -1,0 +1,15 @@
+export const CODES = {
+  CASH: "1000",
+  MPESA: "1010",
+  CARD: "1020",
+  BANK: "1030",
+  AR: "1100",
+  INVENTORY: "1200",
+  VAT: "2100",
+  EQUITY: "3000",
+  SALES: "4000",
+  COGS: "5000",
+  REFUND_EXP: "5200",
+  WRITE_OFF: "5300",
+  BAD_DEBT: "5400",
+} as const;

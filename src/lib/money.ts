@@ -14,6 +14,12 @@ export function formatKes(amount: number) {
   return `KSh ${formatKesAmount(amount)}`;
 }
 
+export function formatMoneyParts(n: number) {
+  const [whole, frac] = Math.abs(n).toFixed(2).split(".");
+  const withCommas = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return { whole: `${n < 0 ? "-" : ""}${withCommas}`, frac };
+}
+
 export function roundMoney(n: number) {
   if (!Number.isFinite(n)) return 0;
   return Math.round(n * 100) / 100;

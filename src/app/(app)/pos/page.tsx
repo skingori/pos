@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { clampUnitPrice, formatKes, roundMoney } from "@/lib/money";
 import { computeTax } from "@/lib/tax";
 import { useSession } from "next-auth/react";
-import { canChangePrice, canSellCredit } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { Role } from "@prisma/client";
 import Link from "next/link";
 import {
@@ -18,6 +19,7 @@ import { CustomerPicker } from "@/components/customer-picker";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { downloadReceiptPdf, emailReceipt } from "@/lib/receipt-export";
 import { printThermalReceipt } from "@/lib/print-thermal";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 type PayMethod = "CASH" | "MPESA" | "CARD" | "BANK" | "CREDIT";
 
@@ -190,10 +192,22 @@ function IconPlay({ className = "h-3 w-3" }: { className?: string }) {
 }
 
 export default function PosPage() {
+  return (
+    <Suspense fallback={<p className="p-6 text-sm text-slate-500">Loading POS…</p>}>
+      <PosInner />
+    </Suspense>
+  );
+}
+
+function PosInner() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const { data: session } = useSession();
   const role = session?.user?.role as Role | undefined;
-  const canCredit = Boolean(role && canSellCredit(role));
-  const canDiscount = Boolean(role && canChangePrice(role));
+  const canCredit = hasPermission(session?.user, "sales.credit");
+  const canDiscount = hasPermission(session?.user, "price.override");
+  const copySaleHandled = useRef<string | null>(null);
+  const cartRef = useRef<CartItem[]>([]);
 
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -213,7 +227,7 @@ export default function PosPage() {
   const [onCredit, setOnCredit] = useState(false);
   const [split, setSplit] = useState(false);
   const [payMethod, setPayMethod] = useState<PayMethod>("CASH");
-  const [cashTendered, setCashTendered] = useState("");
+  const [cashTenderedOverride, setCashTenderedOverride] = useState<string | null>(null);
   const [mpesaPhone, setMpesaPhone] = useState("");
   const [creditDueAt, setCreditDueAt] = useState(ymdPlus(7));
   const [depositMethod, setDepositMethod] = useState<PayMethod>("CASH");
@@ -230,6 +244,32 @@ export default function PosPage() {
   const [heldSales, setHeldSales] = useState<HeldSale[]>([]);
   const [heldOpen, setHeldOpen] = useState(true);
   const [dueDays, setDueDays] = useState(7);
+  const [replaceConfirm, setReplaceConfirm] = useState<
+    | null
+    | {
+        kind: "copy";
+        sale: {
+          receiptNo?: number;
+          customerId?: string | null;
+          customer?: {
+            name?: string;
+            phone?: string | null;
+            balance?: number;
+            priceLevel?: Customer["priceLevel"];
+          } | null;
+          lines: Array<{
+            productId?: string;
+            name: string;
+            qty: number;
+            unitPrice: number;
+            unit: string;
+          }>;
+        };
+      }
+    | { kind: "held"; id: string }
+  >(null);
+  const [holdOpen, setHoldOpen] = useState(false);
+  const [holdLabel, setHoldLabel] = useState("");
 
   async function refreshHeldSales() {
     const list = await fetch("/api/held-sales")
@@ -267,7 +307,15 @@ export default function PosPage() {
     fetch("/api/products").then((r) => r.json()).then((p) => setProducts(Array.isArray(p) ? p : []));
     fetch("/api/categories").then((r) => r.json()).then((c) => setCategories(Array.isArray(c) ? c : []));
     fetch("/api/customers").then((r) => r.json()).then((c) => setCustomers(Array.isArray(c) ? c : []));
-    fetch("/api/settings").then((r) => r.json()).then(setSettings);
+    function loadSettings() {
+      fetch("/api/settings")
+        .then((r) => r.json())
+        .then((s) => {
+          if (s && typeof s === "object" && !s.error) setSettings(s);
+        })
+        .catch(() => null);
+    }
+    loadSettings();
     fetch("/api/promotions")
       .then((r) => r.json())
       .then((list) => setPromos(Array.isArray(list) ? list.filter((p: Promo) => p.active) : []));
@@ -278,6 +326,24 @@ export default function PosPage() {
         if (c?.branch?.name) setBranchName(c.branch.name);
       })
       .catch(() => setTillOpen(null));
+
+    function onSettingsUpdated(e: Event) {
+      const detail = (e as CustomEvent<ShopSettings>).detail;
+      if (detail && typeof detail === "object" && "vatPercent" in detail) {
+        setSettings(detail);
+        return;
+      }
+      loadSettings();
+    }
+    function onFocus() {
+      loadSettings();
+    }
+    window.addEventListener("sf:settings-updated", onSettingsUpdated);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("sf:settings-updated", onSettingsUpdated);
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
 
   useEffect(() => {
@@ -286,6 +352,161 @@ export default function PosPage() {
     }, 60_000);
     return () => clearInterval(refresh);
   }, []);
+
+  useEffect(() => {
+    cartRef.current = cart;
+  }, [cart]);
+
+  function applyCopiedSale(sale: {
+    receiptNo?: number;
+    customerId?: string | null;
+    customer?: {
+      name?: string;
+      phone?: string | null;
+      balance?: number;
+      priceLevel?: Customer["priceLevel"];
+    } | null;
+    lines: Array<{
+      productId?: string;
+      name: string;
+      qty: number;
+      unitPrice: number;
+      unit: string;
+    }>;
+  }) {
+    const notes: string[] = [];
+    const nextCart: CartItem[] = [];
+    const byProduct = new Map<string, CartItem>();
+
+    for (const line of sale.lines) {
+      const productId = line.productId;
+      if (!productId) {
+        notes.push(`${line.name} (missing product)`);
+        continue;
+      }
+      const p = products.find((x) => x.id === productId && !x.isReturnSku);
+      if (!p) {
+        notes.push(`${line.name} (unavailable)`);
+        continue;
+      }
+      if (p.trackSerial) {
+        notes.push(`${line.name} (serial — add manually)`);
+        continue;
+      }
+      if (p.qty <= 0) {
+        notes.push(`${line.name} (out of stock)`);
+        continue;
+      }
+      const qty = Math.min(Number(line.qty) || 0, p.qty);
+      if (qty <= 0) {
+        notes.push(`${line.name} (out of stock)`);
+        continue;
+      }
+      const existing = byProduct.get(p.id);
+      if (existing) {
+        existing.qty = Math.min(existing.qty + qty, p.qty);
+        continue;
+      }
+      const item: CartItem = {
+        productId: p.id,
+        name: p.name,
+        unit: p.unit || line.unit,
+        qty,
+        unitPrice: clampUnitPrice(Number(line.unitPrice) || p.sellPrice),
+        priceOverridden: true,
+        maxQty: p.qty,
+        trackSerial: false,
+        serials: [],
+        imageUrl: p.imageUrl,
+      };
+      byProduct.set(p.id, item);
+      nextCart.push(item);
+    }
+
+    if (!nextCart.length) {
+      setError(
+        notes.length
+          ? `Nothing copied: ${notes.join("; ")}`
+          : "Nothing to copy from that receipt"
+      );
+      return;
+    }
+
+    setCart(nextCart);
+    setDiscount(0);
+    setDiscountMode("none");
+    setPromoCode("");
+    setPromoMsg(
+      notes.length
+        ? `Copied ${nextCart.length} item(s) from receipt #${sale.receiptNo}. Skipped: ${notes.join("; ")}`
+        : `Copied ${nextCart.length} item(s) from receipt #${sale.receiptNo}`
+    );
+    setCashTenderedOverride(null);
+    setDepositAmount("");
+    setOnCredit(false);
+    setSplit(false);
+    setPayMethod("CASH");
+    setReceipt(null);
+    setError("");
+
+    if (sale.customerId) {
+      setCustomerId(sale.customerId);
+      if (sale.customer?.name) {
+        setCustomers((prev) =>
+          prev.some((c) => c.id === sale.customerId)
+            ? prev
+            : [
+                {
+                  id: sale.customerId as string,
+                  name: sale.customer!.name as string,
+                  phone: sale.customer!.phone || null,
+                  balance: Number(sale.customer!.balance) || 0,
+                  priceLevel: sale.customer!.priceLevel || null,
+                },
+                ...prev,
+              ]
+        );
+      }
+    } else {
+      setCustomerId("");
+    }
+  }
+
+  useEffect(() => {
+    const saleId = searchParams.get("copySale");
+    if (!saleId || !products.length) return;
+    if (copySaleHandled.current === saleId) return;
+
+    let cancelled = false;
+
+    (async () => {
+      const res = await fetch(`/api/sales/${saleId}`);
+      const sale = await res.json().catch(() => null);
+      if (cancelled) return;
+
+      if (!sale?.lines || !Array.isArray(sale.lines)) {
+        copySaleHandled.current = saleId;
+        setError("Could not copy that receipt into POS");
+        router.replace("/pos", { scroll: false });
+        return;
+      }
+
+      copySaleHandled.current = saleId;
+      router.replace("/pos", { scroll: false });
+
+      if (cartRef.current.length > 0) {
+        setReplaceConfirm({ kind: "copy", sale });
+        return;
+      }
+
+      applyCopiedSale(sale);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, products, router]);
 
   const sellable = useMemo(() => products.filter((p) => !p.isReturnSku), [products]);
 
@@ -396,13 +617,14 @@ export default function PosPage() {
                 : []),
             ]
           : [];
+    const vatOn = (settings?.vatPercent || 0) > 0;
     return {
       receiptNo: sale?.receiptNo || 0,
       total: sale?.total ?? total,
       discount: sale?.discount ?? discount,
       subtotal: sale?.subtotal ?? subtotal,
-      taxAmount: sale?.taxAmount ?? taxInfo.taxAmount,
-      taxRate: sale?.taxRate ?? settings?.vatPercent ?? 0,
+      taxAmount: vatOn ? sale?.taxAmount ?? taxInfo.taxAmount : 0,
+      taxRate: vatOn ? sale?.taxRate ?? settings?.vatPercent ?? 0 : 0,
       lines,
       payments: sale?.payments || billPayments,
       customer: sale?.customer || (selectedCustomer ? { name: selectedCustomer.name } : null),
@@ -411,7 +633,7 @@ export default function PosPage() {
         (selectedCustomer ? selectedCustomer.balance : null),
       cashier: session?.user?.name,
       completedAt: sale ? new Date().toISOString() : new Date().toISOString(),
-      shopName: settings?.shopName || "Kenya Hardware",
+      shopName: settings?.shopName || "Shop",
       address: settings?.address,
       phone: settings?.phone,
       kraPin: settings?.kraPin,
@@ -440,6 +662,12 @@ export default function PosPage() {
       ? roundMoney(Math.min(storeCredit, total))
       : 0;
   const amountDueNow = roundMoney(Math.max(0, total - appliedStoreCredit));
+  const cashTendered =
+    cashTenderedOverride != null
+      ? cashTenderedOverride
+      : amountDueNow > 0.01
+        ? String(amountDueNow)
+        : "";
   const tendered = Number(cashTendered) || 0;
   const cashPayActive =
     !onCredit && !split && payMethod === "CASH" && amountDueNow > 0.01;
@@ -454,6 +682,10 @@ export default function PosPage() {
     cashStatus === "ok" && tendered > amountDueNow
       ? roundMoney(tendered - amountDueNow)
       : 0;
+
+  useEffect(() => {
+    setCashTenderedOverride(null);
+  }, [amountDueNow]);
 
   function addProduct(p: Product) {
     if (tillOpen === false) {
@@ -520,7 +752,7 @@ export default function PosPage() {
     setPromoCode("");
     setPromoMsg("");
     setCustomerId("");
-    setCashTendered("");
+    setCashTenderedOverride(null);
     setDepositAmount("");
     setOnCredit(false);
     setSplit(false);
@@ -531,12 +763,15 @@ export default function PosPage() {
     ]);
   }
 
-  async function holdCurrentSale() {
+  function holdCurrentSale() {
     if (!cart.length || loading || receipt) return;
-    const label =
-      (typeof window !== "undefined"
-        ? window.prompt("Label this held sale (optional):")
-        : null) || undefined;
+    setHoldLabel("");
+    setHoldOpen(true);
+  }
+
+  async function confirmHoldSale() {
+    if (!cart.length || loading || receipt) return;
+    const label = holdLabel.trim() || undefined;
     setLoading(true);
     setError("");
     try {
@@ -544,7 +779,7 @@ export default function PosPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          label: label?.trim() || undefined,
+          label,
           cart,
           discount,
           discountMode,
@@ -557,6 +792,8 @@ export default function PosPage() {
         setError(data?.error || "Could not hold sale");
         return;
       }
+      setHoldOpen(false);
+      setHoldLabel("");
       setHeldSales((prev) => [data as HeldSale, ...prev.filter((h) => h.id !== data.id)]);
       setHeldOpen(true);
       clearCartSale();
@@ -565,14 +802,7 @@ export default function PosPage() {
     }
   }
 
-  async function restoreHeld(id: string) {
-    if (loading) return;
-    if (cart.length) {
-      const ok =
-        typeof window === "undefined" ||
-        window.confirm("Replace the current cart with this held sale?");
-      if (!ok) return;
-    }
+  async function restoreHeldNow(id: string) {
     setLoading(true);
     setError("");
     try {
@@ -594,6 +824,15 @@ export default function PosPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function restoreHeld(id: string) {
+    if (loading) return;
+    if (cart.length) {
+      setReplaceConfirm({ kind: "held", id });
+      return;
+    }
+    restoreHeldNow(id);
   }
 
   async function discardHeld(id: string) {
@@ -926,8 +1165,8 @@ export default function PosPage() {
       {tillOpen === false && (
         <div className="sf-alert sf-alert-error flex flex-wrap items-center justify-between gap-2">
           <span>No open drawer at {branchName || "this branch"}.</span>
-          <Link href="/cash/open-day" className="sf-btn sf-btn-primary text-xs">
-            Open day
+          <Link href="/cash/drawer-sessions" className="sf-btn sf-btn-primary text-xs">
+            Open drawer
           </Link>
         </div>
       )}
@@ -1097,9 +1336,10 @@ export default function PosPage() {
                 cart.map((item) => {
                   const unit = lineUnit(item);
                   const lineTotal = roundMoney(unit * item.qty);
-                  const listPrice =
+                  const catalogPrice =
                     products.find((p) => p.id === item.productId)?.sellPrice ?? item.unitPrice;
-                  const belowList = item.priceOverridden && listPrice - unit > 0.004;
+                  const belowList = catalogPrice - unit > 0.004;
+                  const aboveList = unit - catalogPrice > 0.004;
                   const code = productCode(item.name, item.productId);
                   const tone = productTileTone(item.productId || item.name);
                   return (
@@ -1117,11 +1357,17 @@ export default function PosPage() {
                         <div className="flex min-w-0 flex-col gap-0.5">
                           <span className="truncate text-xs font-semibold">{item.name}</span>
                           <span className="text-[11px] text-[var(--sf-muted)]">
-                            List {formatKes(listPrice)} / {item.unit}
+                            {formatKes(unit)} / {item.unit}
+                            {belowList || aboveList ? (
+                              <span className="text-[10px]">
+                                {" "}
+                                · list {formatKes(catalogPrice)}
+                              </span>
+                            ) : null}
                           </span>
                           {belowList && (
                             <span className="w-fit rounded bg-[#FFF4D6] px-1.5 py-0.5 text-[10px] font-semibold text-[#7A4B00]">
-                              Price changed · {formatKes(listPrice - unit)} below list
+                              Price changed · {formatKes(catalogPrice - unit)} below list
                             </span>
                           )}
                           {item.trackSerial && item.serials.length > 0 && (
@@ -1206,9 +1452,13 @@ export default function PosPage() {
           <div className="sf-pos-panel flex min-w-0 flex-col gap-1.5 overflow-hidden p-3">
             <div className="flex items-baseline justify-between gap-3">
               <h3 className="sf-display text-sm font-bold">Totals</h3>
-              <span className="shrink-0 text-[10px] text-[var(--sf-muted)]">
-                Prices include {settings?.vatPercent ?? 16}% VAT
-              </span>
+              {(settings?.vatPercent || 0) > 0 ? (
+                <span className="shrink-0 text-[10px] text-[var(--sf-muted)]">
+                  {settings?.pricesIncludeVat
+                    ? `Prices include ${settings.vatPercent}% VAT`
+                    : `VAT ${settings?.vatPercent}% exclusive`}
+                </span>
+              ) : null}
             </div>
             <div className="sf-totals-row text-xs text-[#3A4452]">
               <span>Subtotal</span>
@@ -1226,10 +1476,12 @@ export default function PosPage() {
                 <span>applied on lines</span>
               </div>
             )}
-            <div className="sf-totals-row text-[11px] text-[var(--sf-muted)]">
-              <span>of which VAT {settings?.vatPercent ?? 16}%</span>
-              <span className="sf-money">{formatKes(taxInfo.taxAmount)}</span>
-            </div>
+            {(settings?.vatPercent || 0) > 0 && taxInfo.taxAmount > 0.009 ? (
+              <div className="sf-totals-row text-[11px] text-[var(--sf-muted)]">
+                <span>of which VAT {settings?.vatPercent}%</span>
+                <span className="sf-money">{formatKes(taxInfo.taxAmount)}</span>
+              </div>
+            ) : null}
             <div className="h-px bg-[#ECE9E2]" />
             <div className="flex min-w-0 items-baseline justify-between gap-3">
               <span className="sf-display text-sm font-bold">Total</span>
@@ -1571,9 +1823,8 @@ export default function PosPage() {
                     <input
                       className="sf-input mt-1"
                       inputMode="decimal"
-                      placeholder={String(amountDueNow || 0)}
                       value={cashTendered}
-                      onChange={(e) => setCashTendered(e.target.value)}
+                      onChange={(e) => setCashTenderedOverride(e.target.value)}
                     />
                   </label>
                 )}
@@ -1711,6 +1962,49 @@ export default function PosPage() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(replaceConfirm)}
+        title="Replace current cart?"
+        message={
+          replaceConfirm?.kind === "held"
+            ? "Your current cart will be replaced with this held sale."
+            : "Your current cart will be replaced with items from that receipt."
+        }
+        confirmLabel="Replace cart"
+        tone="danger"
+        loading={loading}
+        onCancel={() => {
+          if (!loading) setReplaceConfirm(null);
+        }}
+        onConfirm={() => {
+          if (!replaceConfirm) return;
+          const pending = replaceConfirm;
+          setReplaceConfirm(null);
+          if (pending.kind === "held") restoreHeldNow(pending.id);
+          else applyCopiedSale(pending.sale);
+        }}
+      />
+
+      <ConfirmDialog
+        open={holdOpen}
+        title="Hold this sale?"
+        message="Park the cart so you can serve another customer. You can restore it from Held sales."
+        confirmLabel="Hold sale"
+        tone="default"
+        loading={loading}
+        inputLabel="Label (optional)"
+        inputPlaceholder="e.g. Waiting for M-Pesa · Counter 2"
+        inputValue={holdLabel}
+        onInputChange={setHoldLabel}
+        onCancel={() => {
+          if (!loading) {
+            setHoldOpen(false);
+            setHoldLabel("");
+          }
+        }}
+        onConfirm={confirmHoldSale}
+      />
     </div>
   );
 }

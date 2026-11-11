@@ -1,11 +1,32 @@
 "use client";
 
-import { formatKes } from "@/lib/money";
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { formatKes, formatMoneyParts } from "@/lib/money";
 import {
   formatSessionWhen,
   varianceClass,
   type DetailPayload,
 } from "@/lib/cash-ui";
+
+function initials(name: string) {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase() || "")
+    .join("");
+}
+
+function Money({ amount, signed = false }: { amount: number; signed?: boolean }) {
+  const parts = formatMoneyParts(Math.abs(amount));
+  const prefix = signed ? (amount > 0.005 ? "+ " : amount < -0.005 ? "− " : "") : "";
+  return (
+    <span className="font-mono tabular-nums">
+      {prefix}KSh {parts.whole}.{parts.frac}
+    </span>
+  );
+}
 
 export function SessionDetailModal({
   detail,
@@ -16,180 +37,245 @@ export function SessionDetailModal({
   loading: boolean;
   onClose: () => void;
 }) {
-  return (
-    <div className="sf-modal-backdrop">
-      <div className="sf-modal max-w-lg">
-        {loading || !detail ? (
-          <p className="text-sm text-slate-500">Loading session details...</p>
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  const session = detail?.session;
+  const totals = detail?.totals;
+  const closed = session?.status === "CLOSED";
+  const expectedCash = closed
+    ? session?.expectedCash ?? 0
+    : totals?.expectedCash ?? 0;
+  const countedCash = session?.countedCash;
+  const variance = session?.cashDifference;
+  const netMoves = roundish((totals?.cashIn || 0) - (totals?.cashOut || 0));
+
+  if (!mounted) return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[90] flex justify-end bg-slate-900/40"
+      onClick={onClose}
+    >
+      <aside
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="z-report-title"
+        className="flex h-full w-full max-w-[26rem] flex-col overflow-hidden border-l border-[var(--sf-border)] bg-white shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {loading || !session || !totals ? (
+          <p className="p-5 text-sm text-slate-500">Loading session details…</p>
         ) : (
           <>
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <h2 className="text-lg font-semibold">Session details</h2>
-                <p className="mt-1 text-sm text-slate-500">
-                  Per-method reconciliation and recorded adjustments.
+            <header className="shrink-0 border-b border-slate-100 px-4 py-3.5 sm:px-5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-[var(--sf-accent-deep)]">
+                    Z-report · Session
+                  </p>
+                  <h2
+                    id="z-report-title"
+                    className="sf-display mt-1 truncate text-lg font-extrabold tracking-tight text-[var(--sf-brand)] sm:text-xl"
+                  >
+                    {session.branch?.name || "Drawer"} drawer
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  className="grid size-8 shrink-0 place-items-center rounded-full bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-800"
+                  onClick={onClose}
+                  aria-label="Close"
+                >
+                  <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
+                    <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </div>
+
+              <div className="mt-3 flex items-center gap-3">
+                <span className="grid size-9 shrink-0 place-items-center rounded-full bg-[var(--sf-accent-soft)] text-xs font-bold text-[var(--sf-accent-deep)]">
+                  {initials(session.openedBy.name)}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-bold text-[var(--sf-brand)]">
+                    {session.openedBy.name}
+                  </p>
+                  {session.openedBy.email ? (
+                    <p className="truncate text-xs text-[var(--sf-muted)]">
+                      {session.openedBy.email}
+                    </p>
+                  ) : null}
+                </div>
+                <span
+                  className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-bold ${
+                    closed
+                      ? "bg-slate-100 text-slate-700"
+                      : "bg-emerald-50 text-emerald-700"
+                  }`}
+                >
+                  {closed ? "Closed" : "Open"}
+                </span>
+              </div>
+
+              <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                <div className="min-w-0">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--sf-muted)]">
+                    Opened
+                  </p>
+                  <p className="mt-0.5 truncate font-medium text-[var(--sf-brand)]">
+                    {formatSessionWhen(session.createdAt)}
+                  </p>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--sf-muted)]">
+                    Closed
+                  </p>
+                  <p className="mt-0.5 truncate font-medium text-[var(--sf-brand)]">
+                    {session.closedAt
+                      ? formatSessionWhen(session.closedAt)
+                      : "Still open"}
+                  </p>
+                </div>
+              </div>
+            </header>
+
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
+              <div className="rounded-2xl border border-[var(--sf-border)] bg-white p-3.5 text-sm shadow-sm sm:p-4">
+                <Row label="Opening float" value={<Money amount={session.openingFloat} />} />
+                <Row
+                  label="Cash sales"
+                  value={
+                    <span className="text-emerald-700">
+                      <Money amount={totals.cashSales} signed />
+                    </span>
+                  }
+                />
+                <Row
+                  label="Refunds"
+                  value={
+                    <span className="text-rose-700">
+                      <Money amount={-totals.cashRefunds} signed />
+                    </span>
+                  }
+                />
+                <Row
+                  label="Cash out / in"
+                  value={
+                    <span className={netMoves >= 0 ? "text-emerald-700" : "text-rose-700"}>
+                      <Money amount={netMoves} signed />
+                    </span>
+                  }
+                />
+                <Row label="Expected" value={<Money amount={expectedCash} />} strong />
+                {countedCash != null ? (
+                  <Row label="Counted" value={<Money amount={countedCash} />} strong />
+                ) : null}
+                {variance != null ? (
+                  <Row
+                    label="Variance"
+                    value={
+                      <span className={`font-bold ${varianceClass(variance)}`}>
+                        {Math.abs(variance) < 0.005 ? (
+                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
+                            Balanced
+                          </span>
+                        ) : (
+                          formatKes(variance)
+                        )}
+                      </span>
+                    }
+                  />
+                ) : null}
+              </div>
+
+              {session.movements?.length ? (
+                <div className="mt-4">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--sf-muted)]">
+                    Adjustments
+                  </p>
+                  <ul className="mt-2 space-y-2">
+                    {session.movements.map((m) => (
+                      <li
+                        key={m.id}
+                        className="rounded-xl border border-[var(--sf-border)] bg-white px-3.5 py-3 shadow-sm"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-bold text-[var(--sf-brand)]">
+                              {m.note || (m.type === "IN" ? "Cash in" : "Cash out")}
+                            </p>
+                            <p className="mt-0.5 text-xs text-[var(--sf-muted)]">
+                              {formatSessionWhen(m.createdAt)}
+                              {m.user?.name ? ` · ${m.user.name}` : ""}
+                            </p>
+                          </div>
+                          <span
+                            className={`shrink-0 font-mono text-sm font-bold tabular-nums ${
+                              m.type === "IN" ? "text-emerald-700" : "text-rose-700"
+                            }`}
+                          >
+                            {m.type === "IN" ? "+" : "−"}
+                            {formatKes(m.amount).replace("KSh ", "")}
+                          </span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <p className="mt-4 text-center text-xs text-slate-400">No cash adjustments</p>
+              )}
+
+              {session.note ? (
+                <p className="mt-4 rounded-xl bg-slate-50 px-3 py-2.5 text-sm text-slate-600">
+                  {session.note}
                 </p>
-              </div>
-              <button
-                type="button"
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"
-                onClick={onClose}
-              >
-                x
-              </button>
-            </div>
+              ) : null}
 
-            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-sm">
-              <div className="font-medium text-amber-950">
-                Opening cash carried in: {formatKes(detail.session.openingFloat)}
-              </div>
-              <p className="mt-0.5 text-xs text-amber-900/80">
-                This amount was already in the drawer before the session started.
-              </p>
-            </div>
-
-            <dl className="mt-4 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
-              <dt className="text-slate-500">Branch</dt>
-              <dd className="font-medium">{detail.session.branch?.name || "-"}</dd>
-              <dt className="text-slate-500">Opened</dt>
-              <dd className="font-medium">
-                {formatSessionWhen(detail.session.createdAt)} · {detail.session.openedBy.name}
-                {detail.session.openedBy.email && (
-                  <div className="text-xs font-normal text-slate-500">
-                    {detail.session.openedBy.email}
-                  </div>
-                )}
-              </dd>
-              <dt className="text-slate-500">Closed</dt>
-              <dd className="font-medium">
-                {detail.session.closedAt
-                  ? `${formatSessionWhen(detail.session.closedAt)}${
-                      detail.session.closedBy
-                        ? ` · ${detail.session.closedBy.name}`
-                        : ""
-                    }`
-                  : "Still open"}
-              </dd>
-              <dt className="text-slate-500">Opening balance</dt>
-              <dd className="font-medium">{formatKes(detail.session.openingFloat)}</dd>
-            </dl>
-
-            <div className="mt-4 overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="sf-thead">
-                  <tr>
-                    <th className="px-2 py-2 text-left">Method</th>
-                    <th className="px-2 py-2 text-right">Expected</th>
-                    <th className="px-2 py-2 text-right">Counted</th>
-                    <th className="px-2 py-2 text-right">Variance</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr className="sf-row">
-                    <td className="px-2 py-2">Cash</td>
-                    <td className="px-2 py-2 text-right">
-                      {formatKes(
-                        detail.session.status === "CLOSED"
-                          ? detail.session.expectedCash || 0
-                          : detail.totals.expectedCash
-                      )}
-                    </td>
-                    <td className="px-2 py-2 text-right">
-                      {detail.session.countedCash == null
-                        ? "-"
-                        : formatKes(detail.session.countedCash)}
-                    </td>
-                    <td
-                      className={`px-2 py-2 text-right font-medium ${varianceClass(
-                        detail.session.cashDifference
-                      )}`}
-                    >
-                      {detail.session.cashDifference == null
-                        ? "-"
-                        : formatKes(detail.session.cashDifference)}
-                    </td>
-                  </tr>
-                  <tr className="sf-row">
-                    <td className="px-2 py-2">M-Pesa</td>
-                    <td className="px-2 py-2 text-right">
-                      {formatKes(
-                        detail.session.status === "CLOSED"
-                          ? detail.session.expectedMpesa || 0
-                          : detail.totals.expectedMpesa
-                      )}
-                    </td>
-                    <td className="px-2 py-2 text-right">
-                      {detail.session.countedMpesa == null
-                        ? "-"
-                        : formatKes(detail.session.countedMpesa)}
-                    </td>
-                    <td
-                      className={`px-2 py-2 text-right font-medium ${varianceClass(
-                        detail.session.mpesaDifference
-                      )}`}
-                    >
-                      {detail.session.mpesaDifference == null
-                        ? "-"
-                        : formatKes(detail.session.mpesaDifference)}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div className="mt-4">
-              <h3 className="text-sm font-semibold text-[var(--sf-brand)]">
-                Cash drawer breakdown
-              </h3>
-              <ul className="mt-2 space-y-1 text-sm text-slate-700">
-                <li className="flex justify-between gap-2">
-                  <span>Opening float</span>
-                  <span>{formatKes(detail.session.openingFloat)}</span>
-                </li>
-                <li className="flex justify-between gap-2">
-                  <span>Cash sales</span>
-                  <span>+ {formatKes(detail.totals.cashSales)}</span>
-                </li>
-                <li className="flex justify-between gap-2">
-                  <span>Paid in</span>
-                  <span>+ {formatKes(detail.totals.cashIn)}</span>
-                </li>
-                <li className="flex justify-between gap-2">
-                  <span>Paid out</span>
-                  <span>- {formatKes(detail.totals.cashOut)}</span>
-                </li>
-                <li className="flex justify-between gap-2">
-                  <span>Cash refunds</span>
-                  <span>- {formatKes(detail.totals.cashRefunds)}</span>
-                </li>
-                <li className="mt-2 flex justify-between gap-2 border-t border-slate-100 pt-2 font-semibold">
-                  <span>Expected close (cash)</span>
-                  <span>{formatKes(detail.totals.expectedCash)}</span>
-                </li>
-              </ul>
-              {detail.session.movements?.length > 0 && (
-                <ul className="mt-3 max-h-32 space-y-1 overflow-y-auto text-xs text-slate-500">
-                  {detail.session.movements.map((m) => (
-                    <li key={m.id}>
-                      {m.type === "IN" ? "Paid in" : "Paid out"} {formatKes(m.amount)}
-                      {m.note ? ` - ${m.note}` : ""} · {m.user?.name || ""}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {detail.session.note && (
-                <p className="mt-3 text-sm text-slate-600">Note: {detail.session.note}</p>
-              )}
-            </div>
-
-            <div className="mt-5 flex justify-end">
-              <button type="button" className="sf-btn sf-btn-primary" onClick={onClose}>
-                Close
-              </button>
+              {closed && session.closedBy ? (
+                <p className="mt-4 text-xs text-[var(--sf-muted)]">
+                  Closed by {session.closedBy.name}
+                  {session.countedMpesa != null
+                    ? ` · M-Pesa counted ${formatKes(session.countedMpesa)}`
+                    : ""}
+                </p>
+              ) : null}
             </div>
           </>
         )}
-      </div>
+      </aside>
+    </div>,
+    document.body
+  );
+}
+
+function roundish(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+function Row({
+  label,
+  value,
+  strong,
+}: {
+  label: string;
+  value: React.ReactNode;
+  strong?: boolean;
+}) {
+  return (
+    <div
+      className={`flex items-center justify-between gap-3 py-1.5 ${
+        strong
+          ? "mt-1 border-t border-slate-100 pt-2.5 font-semibold text-[var(--sf-brand)]"
+          : "text-[var(--sf-muted)]"
+      }`}
+    >
+      <span className="shrink-0">{label}</span>
+      <span className={`min-w-0 truncate text-right ${strong ? "text-[var(--sf-brand)]" : ""}`}>
+        {value}
+      </span>
     </div>
   );
 }
+

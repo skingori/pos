@@ -44,7 +44,7 @@ function receiptLines(data: ThermalReceiptData & { docType?: "receipt" | "bill" 
   out.push("--------------------------------");
   if (typeof data.subtotal === "number") out.push(`Subtotal: ${formatKes(data.subtotal)}`);
   if ((data.discount || 0) > 0) out.push(`Discount: -${formatKes(data.discount || 0)}`);
-  if ((data.taxAmount || 0) > 0) {
+  if ((data.taxAmount || 0) > 0.009 && (data.taxRate || 0) > 0) {
     out.push(`VAT ${data.taxRate}% (incl.): ${formatKes(data.taxAmount || 0)}`);
   }
   out.push(`TOTAL: ${formatKes(data.total)}`);

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 
 export async function GET() {
   const user = await apiUser();
@@ -16,7 +16,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "purchasing.manage")) return forbidden();
   const body = await req.json();
   const supplier = await prisma.supplier.create({
     data: {

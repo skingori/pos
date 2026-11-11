@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canSellCredit } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { roundMoney } from "@/lib/money";
 import { PaymentMethod } from "@prisma/client";
@@ -22,6 +22,13 @@ const PAY_METHODS = new Set(["CASH", "MPESA", "CARD", "BANK"]);
 export async function GET() {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (
+    !hasPermission(user, "customers.access") &&
+    !hasPermission(user, "reports.view") &&
+    !hasPermission(user, "receipts.access")
+  ) {
+    return forbidden();
+  }
 
   const now = new Date();
   const customers = await prisma.customer.findMany({
@@ -128,11 +135,12 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canSellCredit(user.role)) return forbidden();
+  if (!hasPermission(user, "customers.access")) return forbidden();
 
   const body = await req.json();
   const amount = roundMoney(Number(body.amount));
   const isWriteOff = Boolean(body.isWriteOff);
+  if (isWriteOff && !hasPermission(user, "receivables.write_off")) return forbidden();
   if (amount <= 0) {
     return NextResponse.json({ error: "Invalid amount" }, { status: 400 });
   }

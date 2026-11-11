@@ -103,12 +103,13 @@ export function ThermalReceipt({
     minute: "2-digit",
   });
 
+  const showVat = (data.taxAmount || 0) > 0.009 && (data.taxRate || 0) > 0;
   const exclVat =
-    typeof data.subtotal === "number" && (data.taxAmount || 0) > 0
+    showVat && typeof data.subtotal === "number"
       ? Math.max(0, data.subtotal - (data.taxAmount || 0))
-      : typeof data.subtotal === "number"
-        ? data.subtotal
-        : null;
+      : null;
+  const plainSubtotal =
+    !showVat && typeof data.subtotal === "number" ? data.subtotal : null;
 
   return (
     <div
@@ -126,7 +127,7 @@ export function ThermalReceipt({
         {data.kraPin && (
           <div className="text-[9px] font-semibold opacity-70">
             KRA PIN: {data.kraPin}
-            {(data.taxAmount || 0) > 0 ? " · VAT REGISTERED" : ""}
+            {showVat ? " · VAT REGISTERED" : ""}
           </div>
         )}
         <div className="border-t border-dashed border-black/50 pt-1 text-[11px] font-bold uppercase tracking-wide">
@@ -191,7 +192,7 @@ export function ThermalReceipt({
                 <div className="text-[9px] leading-snug break-all opacity-70">
                   {l.qty}
                   {l.unit ? ` ${clip(l.unit, 8)}` : ""} @ {formatKesAmount(l.unitPrice)}
-                  {(data.taxAmount || 0) > 0 ? ` · ${data.taxRate}% VAT` : ""}
+                  {showVat ? ` · ${data.taxRate}% VAT` : ""}
                 </div>
               </div>
               <div className="max-w-[42%] shrink-0 text-right font-mono text-[10px] leading-tight font-semibold break-all tabular-nums">
@@ -206,10 +207,13 @@ export function ThermalReceipt({
         {exclVat != null && (
           <MoneyRow label="Subtotal (excl. VAT)" value={formatKes(exclVat)} />
         )}
+        {plainSubtotal != null && (data.discount || 0) > 0.009 && (
+          <MoneyRow label="Subtotal" value={formatKes(plainSubtotal)} />
+        )}
         {(data.discount || 0) > 0 && (
           <MoneyRow label="Discount" value={`−${formatKes(data.discount || 0)}`} />
         )}
-        {(data.taxAmount || 0) > 0 && (
+        {showVat && (
           <MoneyRow label={`VAT (${data.taxRate}%)`} value={formatKes(data.taxAmount || 0)} />
         )}
         <MoneyRow label="TOTAL DUE" value={formatKes(data.total)} strong />

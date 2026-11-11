@@ -2,14 +2,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { zodErrorResponse } from "@/lib/api";
-import { getCustomerOpenCharges } from "@/lib/customer-account";
+import {
+  getCustomerOpenCharges,
+  setCustomerStoreCredit,
+} from "@/lib/customer-account";
 import { roundMoney } from "@/lib/money";
+import { writeAudit } from "@/lib/audit";
 
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "customers.access") && !hasPermission(user, "pos.access")) {
+    return forbidden();
+  }
 
   const q = req.nextUrl.searchParams.get("q")?.trim();
   const owingOnly = req.nextUrl.searchParams.get("owing") === "1";
@@ -86,6 +93,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "customers.access")) return forbidden();
   try {
     const body = z
       .object({
@@ -93,19 +101,43 @@ export async function POST(req: NextRequest) {
         phone: z.string().nullable().optional(),
         email: z.union([z.string().email(), z.literal(""), z.null()]).optional(),
         creditLimit: z.number().min(0).optional(),
+        storeCredit: z.number().min(0).optional(),
         priceLevelId: z.string().nullable().optional(),
       })
       .parse(await req.json());
+    const canSetLimit =
+      hasPermission(user, "customers.credit_limit") ||
+      hasPermission(user, "customers.access");
     const customer = await prisma.customer.create({
       data: {
         name: body.name,
         phone: body.phone || null,
         email: body.email || null,
-        creditLimit: body.creditLimit || 0,
+        creditLimit: canSetLimit ? body.creditLimit || 0 : 0,
         priceLevelId: body.priceLevelId || null,
       },
       include: { priceLevel: true },
     });
+
+    if (body.storeCredit != null && body.storeCredit > 0.009) {
+      try {
+        await setCustomerStoreCredit({
+          customerId: customer.id,
+          targetCredit: body.storeCredit,
+          userId: user.id,
+          note: "Opening store credit",
+        });
+      } catch (err) {
+        return NextResponse.json(
+          {
+            error:
+              err instanceof Error ? err.message : "Customer created but store credit failed",
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     return NextResponse.json(customer, { status: 201 });
   } catch (e) {
     return zodErrorResponse(e);
@@ -115,7 +147,7 @@ export async function POST(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "customers.access")) return forbidden();
   try {
     const body = z
       .object({
@@ -124,17 +156,50 @@ export async function PATCH(req: NextRequest) {
         phone: z.string().nullable().optional(),
         email: z.string().nullable().optional(),
         creditLimit: z.number().optional(),
+        storeCredit: z.number().min(0).optional(),
         priceLevelId: z.string().nullable().optional(),
         active: z.boolean().optional(),
       })
       .parse(await req.json());
+    const canSetLimit =
+      hasPermission(user, "customers.credit_limit") ||
+      hasPermission(user, "customers.access");
+
+    if (body.storeCredit !== undefined) {
+      try {
+        await setCustomerStoreCredit({
+          customerId: body.id,
+          targetCredit: body.storeCredit,
+          userId: user.id,
+          note: "Edited on customers list",
+        });
+      } catch (err) {
+        return NextResponse.json(
+          {
+            error:
+              err instanceof Error ? err.message : "Could not update store credit",
+          },
+          { status: 400 }
+        );
+      }
+      await writeAudit({
+        userId: user.id,
+        action: "UPDATE",
+        entity: "Customer",
+        entityId: body.id,
+        detail: `edit store credit ${body.storeCredit}`,
+      });
+    }
+
     const customer = await prisma.customer.update({
       where: { id: body.id },
       data: {
         name: body.name,
         phone: body.phone,
         email: body.email,
-        creditLimit: body.creditLimit,
+        ...(canSetLimit && body.creditLimit !== undefined
+          ? { creditLimit: body.creditLimit }
+          : {}),
         priceLevelId: body.priceLevelId,
         active: body.active,
       },

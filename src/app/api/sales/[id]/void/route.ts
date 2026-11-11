@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canApproveRefund } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { roundMoney } from "@/lib/money";
 import { getCustomerOpenCharges } from "@/lib/customer-account";
@@ -18,7 +18,7 @@ export async function POST(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canApproveRefund(user.role)) return forbidden();
+  if (!hasPermission(user, "refunds.approve")) return forbidden();
 
   const { id } = await params;
   const body = await req.json().catch(() => ({}));

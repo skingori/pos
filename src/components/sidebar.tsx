@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
-import { canManageUsers, canViewAudit } from "@/lib/permissions";
+import { hasPermission, type Permission } from "@/lib/permissions";
 import { formatKes } from "@/lib/money";
 import { Role } from "@prisma/client";
 import type { CashSessionInfo } from "./app-shell";
@@ -24,7 +24,6 @@ import {
   IconTruck,
   IconUndo,
   IconUsers,
-  IconWallet,
 } from "./ui/icons";
 
 type IconTone = "ops" | "stock" | "commerce" | "insights" | "admin";
@@ -34,10 +33,8 @@ type NavItem = {
   label: string;
   icon: ReactNode;
   tone: IconTone;
-  audit?: boolean;
-  admin?: boolean;
-  manager?: boolean;
-  badge?: "refunds" | "receivables";
+  permission?: Permission;
+  badge?: "refunds" | "outOfStock";
 };
 
 const groups: { title: string; items: NavItem[] }[] = [
@@ -45,56 +42,99 @@ const groups: { title: string; items: NavItem[] }[] = [
     title: "Operations",
     items: [
       { href: "/overview", label: "Overview", icon: <IconGrid className="size-4" />, tone: "ops" },
-      { href: "/pos", label: "POS", icon: <IconCart className="size-4" />, tone: "ops" },
-      { href: "/cash", label: "Cash", icon: <IconCash className="size-4" />, tone: "ops" },
+      {
+        href: "/pos",
+        label: "POS",
+        icon: <IconCart className="size-4" />,
+        tone: "ops",
+        permission: "pos.access",
+      },
+      {
+        href: "/cash",
+        label: "Cash",
+        icon: <IconCash className="size-4" />,
+        tone: "ops",
+        permission: "cash.access",
+      },
     ],
   },
   {
     title: "Stock",
     items: [
-      { href: "/inventory", label: "Inventory", icon: <IconBox className="size-4" />, tone: "stock" },
-      { href: "/purchasing", label: "Purchasing", icon: <IconTruck className="size-4" />, tone: "stock" },
+      {
+        href: "/inventory",
+        label: "Inventory",
+        icon: <IconBox className="size-4" />,
+        tone: "stock",
+        permission: "inventory.view",
+        badge: "outOfStock",
+      },
+      {
+        href: "/purchasing",
+        label: "Purchasing",
+        icon: <IconTruck className="size-4" />,
+        tone: "stock",
+        permission: "purchasing.view",
+      },
       {
         href: "/branches",
         label: "Branches",
         icon: <IconBuilding className="size-4" />,
         tone: "stock",
-        manager: true,
+        permission: "branches.manage",
       },
     ],
   },
   {
     title: "Commerce",
     items: [
-      { href: "/sales", label: "Sales", icon: <IconChart className="size-4" />, tone: "commerce" },
-      { href: "/receipts", label: "Receipts", icon: <IconReceipt className="size-4" />, tone: "commerce" },
-      { href: "/customers", label: "Customers", icon: <IconUsers className="size-4" />, tone: "commerce" },
+      {
+        href: "/sales",
+        label: "Sales",
+        icon: <IconChart className="size-4" />,
+        tone: "commerce",
+        permission: "sales.view",
+      },
+      {
+        href: "/receipts",
+        label: "Receipts",
+        icon: <IconReceipt className="size-4" />,
+        tone: "commerce",
+        permission: "receipts.access",
+      },
+      {
+        href: "/customers",
+        label: "Customers",
+        icon: <IconUsers className="size-4" />,
+        tone: "commerce",
+        permission: "customers.access",
+      },
       {
         href: "/refunds",
         label: "Refund requests",
         icon: <IconUndo className="size-4" />,
         tone: "commerce",
+        permission: "refunds.request",
         badge: "refunds",
-      },
-      {
-        href: "/receivables",
-        label: "Receivables",
-        icon: <IconWallet className="size-4" />,
-        tone: "commerce",
-        badge: "receivables",
       },
     ],
   },
   {
     title: "Insights",
     items: [
-      { href: "/reports", label: "Reports", icon: <IconChart className="size-4" />, tone: "insights" },
+      {
+        href: "/reports",
+        label: "Reports",
+        icon: <IconChart className="size-4" />,
+        tone: "insights",
+        permission: "reports.view",
+      },
       {
         href: "/accounting",
         label: "Accounting",
         icon: <IconLedger className="size-4" />,
         tone: "insights",
-        manager: true,
+        permission: "accounting.view",
       },
     ],
   },
@@ -102,19 +142,32 @@ const groups: { title: string; items: NavItem[] }[] = [
     title: "Admin",
     items: [
       {
+        href: "/settings",
+        label: "Settings",
+        icon: <IconSettings className="size-4" />,
+        tone: "admin",
+        permission: "settings.manage",
+      },
+      {
         href: "/promotions",
         label: "Promotions",
         icon: <IconTag className="size-4" />,
         tone: "admin",
-        manager: true,
+        permission: "promotions.manage",
       },
-      { href: "/users", label: "Users", icon: <IconUsers className="size-4" />, tone: "admin", admin: true },
+      {
+        href: "/users",
+        label: "Users",
+        icon: <IconUsers className="size-4" />,
+        tone: "admin",
+        permission: "users.manage",
+      },
       {
         href: "/audit",
         label: "Audit logs",
         icon: <IconShield className="size-4" />,
         tone: "admin",
-        audit: true,
+        permission: "audit.view",
       },
     ],
   },
@@ -154,38 +207,68 @@ export function Sidebar({
   const pathname = usePathname();
   const { data } = useSession();
   const role = data?.user?.role as Role | undefined;
-  const shop = process.env.NEXT_PUBLIC_SHOP_NAME || "Kenya Hardware";
+  const [shop, setShop] = useState("Shop");
   const [pendingRefunds, setPendingRefunds] = useState(0);
-  const [openReceivables, setOpenReceivables] = useState(0);
+  const [outOfStock, setOutOfStock] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      fetch("/api/refunds")
-        .then((r) => r.json())
-        .catch(() => []),
-      fetch("/api/receivables")
-        .then((r) => r.json())
-        .catch(() => null),
-    ]).then(([refunds, receivables]) => {
-      if (cancelled) return;
-      setPendingRefunds(
-        Array.isArray(refunds)
-          ? refunds.filter((r: { status?: string }) => r.status === "PENDING").length
-          : 0
-      );
-      setOpenReceivables(Number(receivables?.summary?.openReceipts || 0));
-    });
+    fetch("/api/branding")
+      .then((r) => r.json())
+      .catch(() => null)
+      .then((branding) => {
+        if (cancelled || !branding?.shopName) return;
+        setShop(String(branding.shopName));
+      });
+
+    function onShopUpdated(e: Event) {
+      const name = (e as CustomEvent<{ shopName?: string }>).detail?.shopName;
+      if (name) setShop(String(name));
+    }
+    window.addEventListener("sf:shop-updated", onShopUpdated);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("sf:shop-updated", onShopUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/refunds")
+      .then((r) => r.json())
+      .catch(() => [])
+      .then((refunds) => {
+        if (cancelled) return;
+        setPendingRefunds(
+          Array.isArray(refunds)
+            ? refunds.filter((r: { status?: string }) => r.status === "PENDING").length
+            : 0
+        );
+      });
     return () => {
       cancelled = true;
     };
   }, []);
 
+  useEffect(() => {
+    if (!hasPermission(data?.user, "inventory.view")) return;
+    let cancelled = false;
+    fetch("/api/products?stockAlerts=1")
+      .then((r) => r.json())
+      .catch(() => null)
+      .then((alerts) => {
+        if (cancelled || !alerts) return;
+        setOutOfStock(Number(alerts.outOfStock) || 0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [data?.user]);
+
   function visible(item: NavItem) {
-    if (item.audit && role && !canViewAudit(role)) return false;
-    if (item.admin && role && !canManageUsers(role)) return false;
-    if (item.manager && role && role === "ATTENDANT") return false;
-    return true;
+    if (!item.permission) return true;
+    return hasPermission(data?.user, item.permission);
   }
 
   function badgeFor(item: NavItem) {
@@ -196,10 +279,13 @@ export function Sidebar({
         </span>
       );
     }
-    if (item.badge === "receivables" && openReceivables > 0) {
+    if (item.badge === "outOfStock" && outOfStock > 0) {
       return (
-        <span className="ml-auto rounded-md bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200">
-          {openReceivables}
+        <span
+          className="ml-auto rounded-md bg-rose-500 px-1.5 py-0.5 text-[10px] font-semibold text-white"
+          title={`${outOfStock} out of stock`}
+        >
+          {outOfStock}
         </span>
       );
     }
@@ -249,7 +335,7 @@ export function Sidebar({
           </div>
 
           <Link
-            href={shiftOpen ? "/cash" : "/cash/open-day"}
+            href="/cash"
             onClick={onClose}
             className={`mt-3 flex items-center gap-2.5 rounded-xl border px-3 py-2 transition ${
               shiftOpen
@@ -281,8 +367,8 @@ export function Sidebar({
               </p>
               <p className="truncate text-[10px] text-slate-400">
                 {shiftOpen
-                  ? `Float ${formatKes(cashSession!.openingFloat)} · ${cashSession!.openedBy}`
-                  : "Tap to open day"}
+                  ? `Started ${cashSession!.openedAtLabel} · Float ${formatKes(cashSession!.openingFloat)}`
+                  : "Tap to open drawer"}
               </p>
             </div>
           </Link>
@@ -344,15 +430,6 @@ export function Sidebar({
               <p className="truncate text-sm font-medium text-white">{userName}</p>
               <p className="truncate text-[11px] text-[var(--sf-sidebar-muted)]">{userRole}</p>
             </div>
-            <Link
-              href="/settings"
-              aria-label="Settings"
-              title="Settings"
-              onClick={onClose}
-              className="grid size-8 place-items-center rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
-            >
-              <IconSettings className="size-4" />
-            </Link>
             <button
               type="button"
               aria-label="Sign out"

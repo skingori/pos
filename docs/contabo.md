@@ -4,6 +4,28 @@ One VPS runs the Next.js app and PostgreSQL via Docker. No separate API host. No
 
 **No domain needed.** Use the Contabo public IP (`http://YOUR.IP:3000`). Add a domain + HTTPS later when you want.
 
+## Deploy from your laptop (recommended)
+
+After the server has Docker + `/opt/point_of_sale` + a working `.env` once:
+
+```bash
+# from your laptop, in this repo
+chmod +x scripts/deploy-contabo.sh
+DEPLOY_HOST=root@5.183.33.187 ./scripts/deploy-contabo.sh
+```
+
+What it does:
+1. `rsync` code to the VPS (does **not** overwrite server `.env`)
+2. `docker compose ... up -d --build`
+3. `prisma migrate deploy`
+4. Hits `/api/health`
+
+One-off remote command (e.g. seed):
+
+```bash
+ssh root@5.183.33.187 'cd /opt/point_of_sale && docker compose -f docker-compose.prod.yml exec -T -e ALLOW_SEED=1 app npx tsx prisma/seed.ts'
+```
+
 ## 1. Create the VPS
 
 1. Contabo → **Cloud VPS** (Cloud VPS 10 or higher; **2GB+ RAM** recommended).

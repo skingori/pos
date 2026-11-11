@@ -3,6 +3,8 @@ import CredentialsProvider from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 import { prisma } from "./prisma";
 import { Role } from "@prisma/client";
+import { ensureUserHasPermissions } from "./rbac";
+import type { Permission } from "./permissions";
 
 declare module "next-auth" {
   interface Session {
@@ -11,12 +13,14 @@ declare module "next-auth" {
       name?: string | null;
       email?: string | null;
       role: Role;
+      permissions: Permission[];
       mustChangePassword: boolean;
       branchId?: string | null;
     };
   }
   interface User {
     role: Role;
+    permissions: Permission[];
     mustChangePassword: boolean;
     branchId?: string | null;
   }
@@ -26,6 +30,7 @@ declare module "next-auth/jwt" {
   interface JWT {
     id: string;
     role: Role;
+    permissions: Permission[];
     mustChangePassword: boolean;
     branchId?: string | null;
   }
@@ -72,11 +77,13 @@ export const authOptions: NextAuthOptions = {
         if (!user || !user.active) return null;
         const ok = await bcrypt.compare(credentials.password, user.passwordHash);
         if (!ok) return null;
+        const permissions = await ensureUserHasPermissions(user.id, user.role);
         return {
           id: user.id,
           name: user.name,
           email: user.email,
           role: user.role,
+          permissions,
           mustChangePassword: user.mustChangePassword,
           branchId: user.branchId,
         };
@@ -88,11 +95,20 @@ export const authOptions: NextAuthOptions = {
       if (user) {
         token.id = user.id;
         token.role = user.role;
+        token.permissions = user.permissions ?? [];
         token.mustChangePassword = user.mustChangePassword;
         token.branchId = user.branchId;
       }
-      if (trigger === "update" && session && typeof session.mustChangePassword === "boolean") {
-        token.mustChangePassword = session.mustChangePassword;
+      if (trigger === "update" && session) {
+        if (typeof session.mustChangePassword === "boolean") {
+          token.mustChangePassword = session.mustChangePassword;
+        }
+        if (Array.isArray(session.permissions)) {
+          token.permissions = session.permissions;
+        }
+        if (session.role) {
+          token.role = session.role;
+        }
       }
       return token;
     },
@@ -100,6 +116,7 @@ export const authOptions: NextAuthOptions = {
       if (session.user) {
         session.user.id = token.id;
         session.user.role = token.role;
+        session.user.permissions = token.permissions ?? [];
         session.user.mustChangePassword = Boolean(token.mustChangePassword);
         session.user.branchId = token.branchId ?? null;
       }

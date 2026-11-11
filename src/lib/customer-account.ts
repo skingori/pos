@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { roundMoney } from "./money";
+import { postCustomerPaymentJournal } from "./gl";
 
 export type OpenCharge = {
   saleId: string;
@@ -34,7 +35,7 @@ export async function getCustomerOpenCharges(customerId: string): Promise<OpenCh
     }),
     prisma.customerPayment.findMany({
       where: { customerId },
-      select: { amount: true, saleId: true },
+      select: { amount: true, saleId: true, isStoreCreditReversal: true },
     }),
     prisma.refundRequest.findMany({
       where: {
@@ -74,6 +75,8 @@ export async function getCustomerOpenCharges(customerId: string): Promise<OpenCh
   const targetedBySale = new Map<string, number>();
   let untargeted = storeCreditFromRefunds;
   for (const p of payments) {
+    // Store-credit reductions do not settle open receipts.
+    if (p.isStoreCreditReversal) continue;
     if (p.saleId && creditedBySale.has(p.saleId)) {
       targetedBySale.set(
         p.saleId,
@@ -156,7 +159,14 @@ export async function reconcileCustomerBalance(
 export type LedgerEntry = {
   id: string;
   at: string;
-  type: "CREDIT_SALE" | "PAYMENT" | "WRITE_OFF" | "CREDIT_REFUND" | "OPENING" | "CLOSING";
+  type:
+    | "CREDIT_SALE"
+    | "PAYMENT"
+    | "WRITE_OFF"
+    | "CREDIT_REFUND"
+    | "STORE_CREDIT_REVERSAL"
+    | "OPENING"
+    | "CLOSING";
   label: string;
   ref: string;
   detail: string | null;
@@ -164,6 +174,69 @@ export type LedgerEntry = {
   paid: number;
   balanceAfter: number;
 };
+
+/** Set absolute prepaid store credit when the account has no outstanding debt. */
+export async function setCustomerStoreCredit(opts: {
+  customerId: string;
+  targetCredit: number;
+  userId: string;
+  method?: "CASH" | "MPESA" | "BANK";
+  note?: string | null;
+}): Promise<{ previousCredit: number; newCredit: number; delta: number }> {
+  const target = roundMoney(Math.max(0, opts.targetCredit));
+  const closing = await getLedgerClosingBalance(opts.customerId);
+  const owed = Math.max(0, closing);
+  const previousCredit = Math.max(0, -closing);
+  if (owed > 0.009) {
+    throw new Error(
+      "Clear outstanding balance before editing store credit, or use Record payment so excess becomes credit."
+    );
+  }
+  const delta = roundMoney(target - previousCredit);
+  if (Math.abs(delta) <= 0.009) {
+    return { previousCredit, newCredit: previousCredit, delta: 0 };
+  }
+
+  const customer = await prisma.customer.findUnique({
+    where: { id: opts.customerId },
+    select: { name: true },
+  });
+  if (!customer) throw new Error("Customer not found");
+
+  const payment = await prisma.$transaction(async (tx) => {
+    const p = await tx.customerPayment.create({
+      data: {
+        customerId: opts.customerId,
+        amount: Math.abs(delta),
+        method: opts.method || "CASH",
+        note:
+          opts.note ||
+          (delta > 0 ? "Store credit deposit" : "Store credit reduction"),
+        isWriteOff: false,
+        isStoreCreditReversal: delta < 0,
+        userId: opts.userId,
+      },
+    });
+    await postCustomerPaymentJournal(tx, {
+      id: p.id,
+      receiptNo: p.receiptNo,
+      amount: p.amount,
+      method: p.method,
+      customerName: customer.name,
+      isWriteOff: false,
+      isStoreCreditReversal: p.isStoreCreditReversal,
+    });
+    return p;
+  });
+
+  void payment;
+  const newBalance = await reconcileCustomerBalance(opts.customerId);
+  return {
+    previousCredit,
+    newCredit: Math.max(0, -newBalance),
+    delta,
+  };
+}
 
 /**
  * Statement lines matching Stockflow: credit sales, then each payment/write-off
@@ -216,6 +289,7 @@ export async function buildCustomerLedger(customerId: string): Promise<LedgerEnt
         amount: number;
         method: string;
         isWriteOff: boolean;
+        isStoreCreditReversal: boolean;
         note: string | null;
         userName: string | null;
         targetSaleId: string | null;
@@ -253,6 +327,7 @@ export async function buildCustomerLedger(customerId: string): Promise<LedgerEnt
       amount: p.amount,
       method: p.method,
       isWriteOff: p.isWriteOff,
+      isStoreCreditReversal: Boolean(p.isStoreCreditReversal),
       note: p.note,
       userName: p.user?.name || null,
       targetSaleId: p.saleId || null,
@@ -327,6 +402,22 @@ export async function buildCustomerLedger(customerId: string): Promise<LedgerEnt
         detail: ev.reason || "Credit refund",
         owed: 0,
         paid: ev.amount,
+        balanceAfter: running,
+      });
+      continue;
+    }
+
+    if (ev.isStoreCreditReversal) {
+      running = roundMoney(running + ev.amount);
+      entries.push({
+        id: `pay-${ev.id}-0`,
+        at: ev.at.toISOString(),
+        type: "STORE_CREDIT_REVERSAL",
+        label: "Credit used",
+        ref: `Adjustment #${ev.receiptNo}`,
+        detail: ev.note || "Store credit reduction",
+        owed: ev.amount,
+        paid: 0,
         balanceAfter: running,
       });
       continue;

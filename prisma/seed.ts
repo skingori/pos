@@ -1,5 +1,11 @@
 import { PrismaClient, Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
+import {
+  backfillUserPermissionsFromRoles,
+  ensureSystemAccessGroups,
+  setUserPermissions,
+} from "../src/lib/rbac";
+import { ROLE_DEFAULT_PERMISSIONS } from "../src/lib/permissions";
 
 const prisma = new PrismaClient();
 
@@ -29,12 +35,18 @@ async function main() {
     { name: "Admin", email: "admin@hardware.local", role: Role.ADMIN, password: "admin123" },
   ];
 
+  await ensureSystemAccessGroups(prisma);
+
   for (const u of users) {
-    await prisma.user.upsert({
+    const code =
+      u.role === Role.ADMIN ? "ADMIN" : u.role === Role.MANAGER ? "MANAGER" : "ATTENDANT";
+    const group = await prisma.accessGroup.findUnique({ where: { code } });
+    const user = await prisma.user.upsert({
       where: { email: u.email },
       update: {
         passwordHash: await bcrypt.hash(u.password, 12),
         role: u.role,
+        groupId: group?.id,
         active: true,
         name: u.name,
         mustChangePassword: true,
@@ -45,11 +57,15 @@ async function main() {
         email: u.email,
         passwordHash: await bcrypt.hash(u.password, 12),
         role: u.role,
+        groupId: group?.id,
         mustChangePassword: true,
         branchId: mainBranch.id,
       },
     });
+    await setUserPermissions(user.id, ROLE_DEFAULT_PERMISSIONS[u.role], prisma);
   }
+
+  await backfillUserPermissionsFromRoles(prisma);
 
   const categories = ["Fasteners", "Pipes", "Paint", "Tools", "Cement & Aggregates"];
   for (const name of categories) {

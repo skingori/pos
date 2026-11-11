@@ -73,7 +73,7 @@ Refund amount = original line sell price × qty returned.
 - Price levels (e.g. Wholesale % off) on customers
 - Promotions (% off storewide or per product)
 - Purchase orders (ORDERED → receive later)
-- Report center (QB-style): sales overview graphs, sales by item/customer/cashier, inventory stock status, receivables, tax & refunds; searchable/sortable data tables; CSV export
+- Report center (Kenya shop-floor): Day close, Tenders (Cash/M-Pesa/Card/Credit), Items & categories, Credit & collections, Stock, Purchases, VAT & returns (internal summary — not eTIMS); links to drawer Z-report; CSV export. See [kenya-hardware-reports.md](./kenya-hardware-reports.md)
 - Company settings + user management (admin)
 - Health check: `GET /api/health`
 

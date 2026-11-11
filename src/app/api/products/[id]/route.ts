@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory, canChangePrice } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { roundMoney } from "@/lib/money";
 import { getOrCreateReturnSku } from "@/lib/return-sku";
@@ -22,7 +22,7 @@ export async function PATCH(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "inventory.manage")) return forbidden();
 
   const branchId = await resolveBranchId(user);
   const { id } = await params;
@@ -118,7 +118,7 @@ export async function PATCH(
     }
   }
 
-  if (body.sellPrice != null && body.sellPrice !== existing.sellPrice && !canChangePrice(user.role)) {
+  if (body.sellPrice != null && body.sellPrice !== existing.sellPrice && !hasPermission(user, "price.override")) {
     return forbidden();
   }
 
@@ -190,7 +190,7 @@ export async function DELETE(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role)) return forbidden();
+  if (!hasPermission(user, "inventory.manage")) return forbidden();
 
   const { id } = await params;
   const product = await prisma.product.update({

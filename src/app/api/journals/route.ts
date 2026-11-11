@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { apiUser, unauthorized } from "@/lib/api-auth";
+import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
+import { hasPermission } from "@/lib/permissions";
 import { ensureChartOfAccounts } from "@/lib/gl";
 
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "accounting.view")) return forbidden();
 
   await ensureChartOfAccounts();
 

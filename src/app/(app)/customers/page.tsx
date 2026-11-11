@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
-import { formatKes } from "@/lib/money";
+import { useRouter, useSearchParams } from "next/navigation";
+import { formatKes, formatMoneyParts } from "@/lib/money";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 type Customer = {
@@ -23,129 +24,57 @@ type Customer = {
 };
 
 type PriceLevel = { id: string; name: string; discountPercent: number };
-type StatusFilter = "ALL" | "ACTIVE" | "INACTIVE" | "OWING";
-type SortKey = "name" | "balance" | "createdAt" | "status";
-
-const PAGE_SIZE = 10;
-
-const AVATAR_TONES = [
-  "bg-rose-100 text-rose-700",
-  "bg-violet-100 text-violet-700",
-  "bg-sky-100 text-sky-700",
-  "bg-amber-100 text-amber-800",
-  "bg-emerald-100 text-emerald-700",
-  "bg-orange-100 text-orange-800",
-  "bg-fuchsia-100 text-fuchsia-700",
-  "bg-cyan-100 text-cyan-800",
-];
+type QuickFilter = "all" | "active" | "inactive" | "owing" | "credit";
+type FocusStat = "total" | "active" | "owing" | "credit";
 
 function initials(name: string) {
-  return name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((w) => w[0])
-    .join("")
-    .toUpperCase();
-}
-
-function avatarTone(seed: string) {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h + seed.charCodeAt(i) * (i + 1)) % AVATAR_TONES.length;
-  return AVATAR_TONES[h];
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0])
+      .join("")
+      .toUpperCase() || "?"
+  );
 }
 
 function formatCreated(iso?: string) {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-}
-
-function IconSearch({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <circle cx="11" cy="11" r="7" />
-      <path d="M20 20l-3-3" />
-    </svg>
-  );
-}
-
-function IconFilter({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
-    </svg>
-  );
-}
-
-function IconUserPlus({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M19 8v6M22 11h-6" />
-    </svg>
-  );
-}
-
-function IconCheck({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-      <path d="M5 13l4 4L19 7" />
-    </svg>
-  );
-}
-
-function IconClock({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <circle cx="12" cy="12" r="9" />
-      <path d="M12 7v5l3 2" />
-    </svg>
-  );
-}
-
-function IconSort({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
-      <path d="M8 7l4-4 4 4H8zm0 10l4 4 4-4H8z" />
-    </svg>
-  );
-}
-
-function IconMore({ className = "h-4 w-4" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
-      <circle cx="12" cy="5" r="1.6" />
-      <circle cx="12" cy="12" r="1.6" />
-      <circle cx="12" cy="19" r="1.6" />
-    </svg>
-  );
-}
-
-function IconShield({ className = "h-3.5 w-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" />
-      <path d="M9 12l2 2 4-4" />
-    </svg>
-  );
+  return d.toLocaleDateString("en-KE", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
 }
 
 export default function CustomersPage() {
+  return (
+    <Suspense fallback={<p className="p-6 text-sm text-slate-500">Loading customers…</p>}>
+      <CustomersInner />
+    </Suspense>
+  );
+}
+
+function CustomersInner() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const filterParam = searchParams.get("filter");
+
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [levels, setLevels] = useState<PriceLevel[]>([]);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
-  const [showFilter, setShowFilter] = useState(false);
-  const [page, setPage] = useState(0);
-  const [sortKey, setSortKey] = useState<SortKey>("name");
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
-  const [menuId, setMenuId] = useState<string | null>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-
+  const [quick, setQuick] = useState<QuickFilter>(() =>
+    filterParam === "owing" ? "owing" : "all"
+  );
+  const [focusStat, setFocusStat] = useState<FocusStat>(() =>
+    filterParam === "owing" ? "owing" : "total"
+  );
+  const [pageSize, setPageSize] = useState(25);
+  const [page, setPage] = useState(1);
   const [showAdd, setShowAdd] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -158,8 +87,15 @@ export default function CustomersPage() {
     phone: "",
     email: "",
     creditLimit: "0",
+    storeCredit: "0",
     priceLevelId: "",
   });
+  const [editOwes, setEditOwes] = useState(false);
+
+  const ghostBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-50 disabled:opacity-50";
+  const primaryBtn =
+    "inline-flex h-8 items-center gap-1.5 rounded-lg bg-indigo-600 px-3 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50";
 
   async function load() {
     setLoading(true);
@@ -168,7 +104,9 @@ export default function CustomersPage() {
     params.set("sort", "name");
     const [c, l] = await Promise.all([
       fetch(`/api/customers?${params}`).then((r) => r.json()),
-      fetch("/api/price-levels").then((r) => r.json()).catch(() => []),
+      fetch("/api/price-levels")
+        .then((r) => r.json())
+        .catch(() => []),
     ]);
     setCustomers(Array.isArray(c) ? c : []);
     setLevels(Array.isArray(l) ? l : []);
@@ -180,29 +118,53 @@ export default function CustomersPage() {
   }, []);
 
   useEffect(() => {
-    if (!menuId) return;
-    const onDoc = (e: MouseEvent) => {
-      if (!menuRef.current?.contains(e.target as Node)) setMenuId(null);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMenuId(null);
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [menuId]);
+    if (filterParam === "owing") {
+      setQuick("owing");
+      setFocusStat("owing");
+    }
+  }, [filterParam]);
 
-  const activeFilterCount = statusFilter === "ALL" ? 0 : 1;
+  useEffect(() => {
+    setPage(1);
+  }, [q, quick, pageSize]);
+
+  const stats = useMemo(() => {
+    const total = customers.length;
+    const active = customers.filter((c) => c.active).length;
+    const inactive = total - active;
+    const owingList = customers.filter((c) => c.balance > 0.009);
+    const owing = owingList.length;
+    const owed = owingList.reduce((s, c) => s + c.balance, 0);
+    const onCredit = customers.filter((c) => c.creditLimit > 0.009).length;
+    const creditCap = customers.reduce((s, c) => s + (c.creditLimit || 0), 0);
+    const topDebtors = [...owingList]
+      .sort((a, b) => b.balance - a.balance)
+      .slice(0, 2)
+      .map((c) => c.name);
+    return { total, active, inactive, owing, owed, onCredit, creditCap, topDebtors };
+  }, [customers]);
+
+  const counts = useMemo(() => {
+    let active = 0;
+    let inactive = 0;
+    let owing = 0;
+    let credit = 0;
+    for (const c of customers) {
+      if (c.active) active += 1;
+      else inactive += 1;
+      if (c.balance > 0.009) owing += 1;
+      if (c.creditLimit > 0.009) credit += 1;
+    }
+    return { all: customers.length, active, inactive, owing, credit };
+  }, [customers]);
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
     let list = customers.filter((c) => {
-      if (statusFilter === "ACTIVE" && !c.active) return false;
-      if (statusFilter === "INACTIVE" && c.active) return false;
-      if (statusFilter === "OWING" && !(c.balance > 0.009)) return false;
+      if (quick === "active" && !c.active) return false;
+      if (quick === "inactive" && c.active) return false;
+      if (quick === "owing" && !(c.balance > 0.009)) return false;
+      if (quick === "credit" && !(c.creditLimit > 0.009)) return false;
       if (!term) return true;
       return (
         c.name.toLowerCase().includes(term) ||
@@ -211,76 +173,62 @@ export default function CustomersPage() {
       );
     });
 
-    list = [...list].sort((a, b) => {
-      let av: string | number = "";
-      let bv: string | number = "";
-      if (sortKey === "name") {
-        av = a.name.toLowerCase();
-        bv = b.name.toLowerCase();
-      } else if (sortKey === "balance") {
-        av = a.balance;
-        bv = b.balance;
-      } else if (sortKey === "createdAt") {
-        av = a.createdAt || "";
-        bv = b.createdAt || "";
-      } else {
-        av = a.active ? 1 : 0;
-        bv = b.active ? 1 : 0;
-      }
-      if (av < bv) return sortDir === "asc" ? -1 : 1;
-      if (av > bv) return sortDir === "asc" ? 1 : -1;
-      return 0;
-    });
-
-    return list;
-  }, [customers, q, statusFilter, sortKey, sortDir]);
-
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const safePage = Math.min(page, pageCount - 1);
-  const pageRows = filtered.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
-  const from = filtered.length === 0 ? 0 : safePage * PAGE_SIZE + 1;
-  const to = Math.min(filtered.length, (safePage + 1) * PAGE_SIZE);
-
-  const pageButtons = useMemo(() => {
-    const max = Math.min(pageCount, 5);
-    const start = Math.min(Math.max(0, safePage - 2), Math.max(0, pageCount - max));
-    return Array.from({ length: max }, (_, i) => start + i);
-  }, [pageCount, safePage]);
-
-  function toggleSort(key: SortKey) {
-    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    else {
-      setSortKey(key);
-      setSortDir("asc");
+    if (quick === "owing") {
+      list = [...list].sort((a, b) => b.balance - a.balance);
+    } else {
+      list = [...list].sort((a, b) => a.name.localeCompare(b.name));
     }
-    setPage(0);
+    return list;
+  }, [customers, q, quick]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, pageCount);
+  const pageStart = filtered.length ? (safePage - 1) * pageSize + 1 : 0;
+  const pageEnd = Math.min(safePage * pageSize, filtered.length);
+  const paged = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  function applyQuick(next: QuickFilter) {
+    setQuick(next);
+    if (next === "owing") setFocusStat("owing");
+    else if (next === "active") setFocusStat("active");
+    else if (next === "credit") setFocusStat("credit");
+    else setFocusStat("total");
+  }
+
+  function resetFilters() {
+    setQ("");
+    applyQuick("all");
   }
 
   function openAdd() {
-    setForm({ name: "", phone: "", email: "", creditLimit: "0", priceLevelId: "" });
+    setForm({
+      name: "",
+      phone: "",
+      email: "",
+      creditLimit: "0",
+      storeCredit: "0",
+      priceLevelId: "",
+    });
+    setEditOwes(false);
     setError("");
     setEditId(null);
     setShowAdd(true);
-    setMenuId(null);
   }
 
   function openEdit(c: Customer) {
+    const storeCredit = Math.max(0, -Number(c.balance) || 0);
     setForm({
       name: c.name,
       phone: c.phone || "",
       email: c.email || "",
       creditLimit: String(c.creditLimit || 0),
+      storeCredit: String(storeCredit),
       priceLevelId: c.priceLevelId || c.priceLevel?.id || "",
     });
+    setEditOwes(Number(c.balance) > 0.009);
     setError("");
     setEditId(c.id);
     setShowAdd(true);
-    setMenuId(null);
-  }
-
-  function askToggleActive(c: Customer) {
-    setMenuId(null);
-    setConfirmStatus(c);
   }
 
   async function confirmToggleActive() {
@@ -308,13 +256,17 @@ export default function CustomersPage() {
     e.preventDefault();
     setError("");
     setSaving(true);
-    const payload = {
+    const payload: Record<string, unknown> = {
       name: form.name.trim(),
       phone: form.phone || null,
       email: form.email || null,
       creditLimit: Number(form.creditLimit) || 0,
       priceLevelId: form.priceLevelId || null,
     };
+    // Prepaid top-up: only when not owing (or on create).
+    if (!editId || !editOwes) {
+      payload.storeCredit = Number(form.storeCredit) || 0;
+    }
     const res = editId
       ? await fetch("/api/customers", {
           method: "PATCH",
@@ -337,316 +289,442 @@ export default function CustomersPage() {
     load();
   }
 
-  function SortHead({
-    label,
-    column,
-    className = "",
-  }: {
-    label: string;
-    column?: SortKey;
-    className?: string;
-  }) {
-    const active = column && sortKey === column;
-    return (
-      <th className={`px-4 py-2.5 text-start align-middle ${className}`}>
-        {column ? (
-          <button
-            type="button"
-            className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500 hover:text-slate-800"
-            onClick={() => toggleSort(column)}
-          >
-            {label}
-            <IconSort className={`h-3 w-3 ${active ? "text-slate-700" : "text-slate-300"}`} />
-          </button>
-        ) : (
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-            {label}
-          </span>
-        )}
-      </th>
-    );
-  }
+  const owedParts = formatMoneyParts(stats.owed);
+  const creditParts = formatMoneyParts(stats.creditCap);
 
   return (
-    <div className="mx-auto max-w-6xl">
-      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-3 sm:px-5">
-          <div className="relative min-w-[16rem] flex-1 sm:max-w-sm">
-            <span className="pointer-events-none absolute inset-y-0 start-0 z-10 flex items-center ps-3.5 text-slate-400">
-              <IconSearch className="h-4 w-4" />
-            </span>
-            <input
-              type="search"
-              className="block w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pe-3 ps-10 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:border-sky-400 focus:bg-white focus:ring-4 focus:ring-sky-100"
-              placeholder="Search customers"
-              aria-label="Search customers"
-              value={q}
-              onChange={(e) => {
-                setQ(e.target.value);
-                setPage(0);
-              }}
-            />
+    <div className="space-y-6">
+      <section
+        className="overflow-clip rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+        aria-label="Customers overview"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold tracking-tight text-slate-900 sm:text-lg">
+              Customers & Accounts
+            </h1>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-slate-500">Credit ledger & contact book</span>
+              <span className="rounded-full bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 ring-1 ring-inset ring-indigo-600/20">
+                Live directory
+              </span>
+              {stats.owing > 0 ? (
+                <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                  {stats.owing} owing
+                </span>
+              ) : null}
+              {stats.inactive > 0 ? (
+                <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 ring-1 ring-inset ring-slate-500/20">
+                  {stats.inactive} inactive
+                </span>
+              ) : null}
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <div className="relative">
-              <button
-                type="button"
-                className="inline-flex items-center gap-x-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                onClick={() => setShowFilter((v) => !v)}
-              >
-                <IconFilter className="h-4 w-4 text-slate-500" />
-                Filter
-                {activeFilterCount > 0 && (
-                  <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-slate-900 px-1.5 text-[11px] font-semibold text-white">
-                    {activeFilterCount}
-                  </span>
-                )}
-              </button>
-              {showFilter && (
-                <div className="absolute end-0 z-20 mt-2 w-48 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg">
-                  {(
-                    [
-                      ["ALL", "All customers"],
-                      ["ACTIVE", "Active"],
-                      ["INACTIVE", "Inactive"],
-                      ["OWING", "Owing only"],
-                    ] as const
-                  ).map(([value, label]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`block w-full px-3 py-2 text-left text-sm hover:bg-slate-50 ${
-                        statusFilter === value ? "font-semibold text-slate-900" : "text-slate-600"
-                      }`}
-                      onClick={() => {
-                        setStatusFilter(value);
-                        setShowFilter(false);
-                        setPage(0);
-                      }}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <button
-              type="button"
-              className="inline-flex items-center gap-x-2 rounded-lg bg-[var(--sf-brand)] px-3 py-2 text-sm font-medium text-white hover:bg-[var(--sf-brand-soft)]"
-              onClick={openAdd}
-            >
-              <IconUserPlus className="h-4 w-4" />
-              New customer
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Link href="/receipts" className={ghostBtn}>
+              View receipts
+            </Link>
+            <button type="button" className={primaryBtn} onClick={openAdd}>
+              + New customer
             </button>
           </div>
         </div>
 
+        <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-4 lg:divide-y-0">
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              focusStat === "total" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setFocusStat("total");
+              applyQuick("all");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Customers
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {stats.total}
+              </span>
+              <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
+                accounts
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {stats.active} active · {stats.inactive} inactive
+            </p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              View all →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              focusStat === "active" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setFocusStat("active");
+              applyQuick("active");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Active
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-emerald-700 sm:text-lg">
+                {stats.active}
+              </span>
+              <span className="rounded bg-emerald-50 px-1 py-0.5 text-[10px] font-medium text-emerald-800">
+                ready for POS
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">Selectable on the till</p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              Show active →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              focusStat === "owing" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setFocusStat("owing");
+              applyQuick("owing");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Pending credit
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-amber-700 sm:text-lg">
+                {owedParts.whole}
+                <span className="text-sm text-amber-400">.{owedParts.frac}</span>
+              </span>
+              {stats.owing > 0 ? (
+                <span className="rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-800">
+                  {stats.owing} accts
+                </span>
+              ) : null}
+            </div>
+            <p className="mt-1 truncate text-[11px] text-slate-500">
+              {stats.topDebtors.length ? stats.topDebtors.join(" & ") : "No open balances"}
+            </p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              Collect →
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`flex flex-col px-3 py-2.5 text-left sm:px-4 ${
+              focusStat === "credit" ? "bg-indigo-50/60" : "hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setFocusStat("credit");
+              applyQuick("credit");
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Credit limits
+            </p>
+            <div className="mt-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {creditParts.whole}
+                <span className="text-sm text-slate-400">.{creditParts.frac}</span>
+              </span>
+              <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-slate-700">
+                {stats.onCredit} caps
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">Approved account credit</p>
+            <span className="mt-1.5 self-start text-[11px] font-medium text-indigo-700">
+              Show credit →
+            </span>
+          </button>
+        </div>
+      </section>
+
+      <div className="space-y-4 rounded-2xl border border-[var(--sf-border)] bg-white p-4 shadow-sm sm:p-5">
+        <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-2 lg:grid-cols-12">
+          <div className="relative sm:col-span-2 lg:col-span-7">
+            <svg
+              className="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-slate-400"
+              viewBox="0 0 20 20"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              aria-hidden
+            >
+              <circle cx="9" cy="9" r="6" />
+              <path d="M14 14l4 4" />
+            </svg>
+            <input
+              type="search"
+              className="w-full rounded-xl border border-[var(--sf-border)] bg-[var(--sf-surface-2)] py-2.5 pl-10 pr-9 text-xs text-[var(--sf-brand)] placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[var(--sf-accent)]"
+              placeholder="Search name, phone, or email…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          </div>
+          <div className="lg:col-span-3">
+            <select
+              className="w-full appearance-none rounded-xl border border-[var(--sf-border)] bg-[var(--sf-surface-2)] px-3.5 py-2.5 text-xs font-medium text-[var(--sf-brand)]"
+              value={quick}
+              onChange={(e) => applyQuick(e.target.value as QuickFilter)}
+            >
+              <option value="all">All customers</option>
+              <option value="active">Active only</option>
+              <option value="inactive">Inactive only</option>
+              <option value="owing">Owing / balance due</option>
+              <option value="credit">Credit accounts</option>
+            </select>
+          </div>
+          <div className="flex justify-end lg:col-span-2">
+            <button
+              type="button"
+              title="Reset all filters"
+              className="inline-flex items-center gap-1 py-2 text-xs font-semibold text-[var(--sf-accent)] hover:text-[var(--sf-accent-deep)]"
+              onClick={resetFilters}
+            >
+              <svg className="size-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                />
+              </svg>
+              <span>Reset</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          <span className="mr-1 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+            Quick Filters:
+          </span>
+          {(
+            [
+              { id: "all" as const, label: `All (${counts.all})` },
+              { id: "active" as const, label: `Active (${counts.active})` },
+              { id: "inactive" as const, label: `Inactive (${counts.inactive})` },
+              { id: "owing" as const, label: `Owing (${counts.owing})` },
+              { id: "credit" as const, label: `Credit (${counts.credit})` },
+            ] as const
+          ).map((pill) => (
+            <button
+              key={pill.id}
+              type="button"
+              onClick={() => applyQuick(pill.id)}
+              className={`rounded-full px-2.5 py-1 text-xs font-semibold transition ${
+                quick === pill.id
+                  ? "border border-orange-200 bg-orange-50 text-orange-800"
+                  : "border border-transparent bg-slate-100 text-slate-600 hover:bg-slate-200"
+              }`}
+            >
+              {pill.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-[var(--sf-border)] bg-white shadow-sm">
+        <div className="hidden grid-cols-12 items-center gap-3 border-b border-[var(--sf-border)] bg-slate-50/80 px-6 py-3.5 text-xs font-bold uppercase tracking-wider text-slate-500 lg:grid">
+          <div className="col-span-3">Customer & Contact</div>
+          <div className="col-span-2">Phone</div>
+          <div className="col-span-2">Outstanding</div>
+          <div className="col-span-1">Status</div>
+          <div className="col-span-1">Joined</div>
+          <div className="col-span-3 text-right">Customer Actions</div>
+        </div>
+
         {loading ? (
-          <p className="px-5 py-16 text-center text-sm text-slate-500">Loading customers…</p>
+          <p className="px-6 py-16 text-center text-sm text-[var(--sf-muted)]">
+            Loading customers…
+          </p>
+        ) : !paged.length ? (
+          <div className="py-16 text-center">
+            <h3 className="text-base font-bold text-[var(--sf-brand)]">
+              No matching customers found
+            </h3>
+            <p className="mt-1 text-xs text-[var(--sf-muted)]">
+              Try adjusting your search or status filters.
+            </p>
+            <button type="button" className="sf-btn sf-btn-accent mt-4" onClick={resetFilters}>
+              Reset filters
+            </button>
+          </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[880px] table-fixed text-sm">
-              <colgroup>
-                <col className="w-[28%]" />
-                <col className="w-[14%]" />
-                <col className="w-[18%]" />
-                <col className="w-[12%]" />
-                <col className="w-[16%]" />
-                <col className="w-[12%]" />
-              </colgroup>
-              <thead>
-                <tr className="border-b border-slate-100">
-                  <SortHead label="Customer" column="name" />
-                  <SortHead label="Phone" />
-                  <SortHead label="Outstanding" column="balance" />
-                  <SortHead label="Date" column="createdAt" />
-                  <SortHead label="Status" column="status" />
-                  <th className="px-4 py-2.5 text-end align-middle">
-                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                      Actions
+          <ul className="divide-y divide-slate-100">
+            {paged.map((c) => {
+              const unpaid = c.balance > 0.009;
+              return (
+                <li
+                  key={c.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => router.push(`/customers/${c.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      router.push(`/customers/${c.id}`);
+                    }
+                  }}
+                  className="grid cursor-pointer grid-cols-1 gap-3 px-4 py-4 transition hover:bg-slate-50/80 sm:px-6 lg:grid-cols-12 lg:items-center lg:gap-3"
+                >
+                  <div className="flex items-center gap-3 lg:col-span-3">
+                    <span className="grid size-9 shrink-0 place-items-center rounded-full bg-slate-200 text-xs font-bold text-slate-700">
+                      {initials(c.name)}
                     </span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {pageRows.map((c) => (
-                  <tr key={c.id} className="odd:bg-white even:bg-slate-50/80 hover:bg-slate-100/80">
-                    <td className="px-4 py-4 align-middle">
-                      <div className="flex min-w-0 items-center gap-x-3">
-                        <span
-                          className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(c.id)}`}
-                        >
-                          {initials(c.name)}
-                        </span>
-                        <div className="min-w-0">
-                          <Link
-                            href={`/customers/${c.id}`}
-                            className="block truncate text-sm font-semibold text-slate-900 hover:text-[var(--sf-brand)]"
-                          >
-                            {c.name}
-                          </Link>
-                          <p className="truncate text-sm text-slate-500">
-                            {c.email || "No email on record"}
-                          </p>
-                          {(c.balance > 0.009 || c.creditLimit > 0) && (
-                            <p className="mt-0.5 inline-flex items-center gap-1 text-xs text-slate-500">
-                              <IconShield className="text-sky-600" />
-                              Credit customer
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    </td>
-                    <td className="truncate px-4 py-4 align-middle text-slate-600">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-[var(--sf-brand)]">
+                        {c.name}
+                      </p>
+                      <p className="truncate text-[11px] text-[var(--sf-muted)]">
+                        {c.email || "No email"}
+                        {c.priceLevel?.name ? ` · ${c.priceLevel.name}` : ""}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="lg:col-span-2">
+                    <p className="font-mono text-xs font-medium text-[var(--sf-brand)]">
                       {c.phone || "—"}
-                    </td>
-                    <td className="px-4 py-4 align-middle">
-                      {c.balance > 0.009 ? (
-                        <span className="inline-flex flex-col gap-0.5">
-                          <span className="inline-flex w-fit items-center rounded-full bg-amber-100 px-2.5 py-1 text-sm font-semibold tabular-nums text-amber-900">
-                            {formatKes(c.balance)}
-                          </span>
-                          <span className="text-sm text-amber-700/80">
-                            {c.openReceipts > 0
-                              ? `${c.openReceipts} open receipt${c.openReceipts === 1 ? "" : "s"}`
-                              : "Balance outstanding"}
-                          </span>
+                    </p>
+                    {c.creditLimit > 0.009 ? (
+                      <p className="mt-0.5 text-[11px] text-[var(--sf-muted)]">
+                        Limit {formatKes(c.creditLimit)}
+                      </p>
+                    ) : (
+                      <p className="mt-0.5 text-[11px] text-[var(--sf-muted)]">No credit cap</p>
+                    )}
+                  </div>
+
+                  <div className="lg:col-span-2">
+                    <p className="font-mono text-sm font-bold text-[var(--sf-brand)]">
+                      {formatKes(c.balance)}
+                    </p>
+                    <p className="text-[11px] text-[var(--sf-muted)]">
+                      {unpaid ? (
+                        <span className="font-semibold text-amber-600">
+                          {c.openReceipts > 0
+                            ? `${c.openReceipts} open receipt${c.openReceipts === 1 ? "" : "s"}`
+                            : "Balance due"}
                         </span>
                       ) : (
-                        <span className="inline-flex flex-col gap-0.5">
-                          <span className="block text-sm font-semibold tabular-nums text-slate-900">
-                            {formatKes(0)}
-                          </span>
-                          <span className="block text-sm text-slate-500">No open receipts</span>
-                        </span>
+                        "Settled"
                       )}
-                    </td>
-                    <td className="px-4 py-4 align-middle text-slate-500">
-                      {formatCreated(c.createdAt)}
-                    </td>
-                    <td className="px-4 py-4 align-middle">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {c.active ? (
-                          <span className="inline-flex items-center gap-x-1.5 rounded-full bg-teal-100 px-2.5 py-1 text-xs font-medium text-teal-800">
-                            <IconCheck />
-                            Active
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-x-1.5 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-700">
-                            <IconClock />
-                            Inactive
-                          </span>
-                        )}
-                        {c.balance > 0.009 && (
-                          <span className="inline-flex items-center gap-x-1.5 rounded-full bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-900">
-                            Owing
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-4 align-middle text-end">
-                      <div
-                        className="relative inline-flex justify-end"
-                        ref={menuId === c.id ? menuRef : undefined}
+                    </p>
+                  </div>
+
+                  <div className="lg:col-span-1">
+                    <span
+                      className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                        !c.active
+                          ? "bg-slate-100 text-slate-600"
+                          : unpaid
+                            ? "bg-amber-100 text-amber-900"
+                            : "bg-emerald-100 text-emerald-800"
+                      }`}
+                    >
+                      {!c.active ? "Inactive" : unpaid ? "Owing" : "Active"}
+                    </span>
+                  </div>
+
+                  <div className="lg:col-span-1">
+                    <p className="text-xs text-[var(--sf-muted)]">{formatCreated(c.createdAt)}</p>
+                  </div>
+
+                  <div
+                    className="flex items-center justify-start lg:col-span-3 lg:justify-end"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="inline-flex overflow-hidden rounded-xl border border-[var(--sf-border)] bg-white shadow-sm">
+                      <button
+                        type="button"
+                        title="Edit details"
+                        className="inline-flex items-center gap-1.5 border-r border-[var(--sf-border)] bg-white px-3 py-2 text-xs font-bold text-[var(--sf-accent-deep)] hover:bg-[var(--sf-accent-soft)]"
+                        onClick={() => openEdit(c)}
                       >
-                        <button
-                          type="button"
-                          className="inline-flex size-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-                          aria-label={`More actions for ${c.name}`}
-                          aria-expanded={menuId === c.id}
-                          aria-haspopup="menu"
-                          onClick={() => setMenuId((id) => (id === c.id ? null : c.id))}
+                        <svg
+                          className="size-3.5"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          aria-hidden
                         >
-                          <IconMore />
-                        </button>
-                        {menuId === c.id && (
-                          <div
-                            role="menu"
-                            className="absolute end-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 text-start shadow-lg ring-1 ring-black/5"
-                          >
-                            <Link
-                              role="menuitem"
-                              href={`/customers/${c.id}`}
-                              className="block px-3 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50"
-                              onClick={() => setMenuId(null)}
-                            >
-                              Open account
-                            </Link>
-                            <button
-                              type="button"
-                              role="menuitem"
-                              className="block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"
-                              onClick={() => openEdit(c)}
-                            >
-                              Edit details
-                            </button>
-                            <div className="my-1 border-t border-slate-100" />
-                            <button
-                              type="button"
-                              role="menuitem"
-                              className={`block w-full px-3 py-2 text-left text-sm font-medium hover:bg-slate-50 ${
-                                c.active ? "text-rose-600" : "text-emerald-700"
-                              }`}
-                              onClick={() => askToggleActive(c)}
-                            >
-                              {c.active ? "Deactivate" : "Activate"}
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-                {!pageRows.length && (
-                  <tr>
-                    <td colSpan={6} className="px-4 py-14 text-center text-sm text-slate-500">
-                      No customers match your filters
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"
+                          />
+                        </svg>
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        title={c.active ? "Deactivate customer" : "Activate customer"}
+                        className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold ${
+                          c.active
+                            ? "bg-rose-50 text-rose-600 hover:bg-rose-100"
+                            : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                        }`}
+                        onClick={() => setConfirmStatus(c)}
+                      >
+                        {c.active ? "Deactivate" : "Activate"}
+                      </button>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         )}
 
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-sm text-slate-500 sm:px-5">
-          <span>
-            Showing {from} to {to} of {filtered.length} customers
-          </span>
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
-              disabled={safePage <= 0}
-              onClick={() => setPage((p) => Math.max(0, p - 1))}
-              aria-label="Previous page"
-            >
-              ‹
-            </button>
-            {pageButtons.map((n) => (
-              <button
-                key={n}
-                type="button"
-                className={`inline-flex size-8 items-center justify-center rounded-lg border text-xs font-medium ${
-                  n === safePage
-                    ? "border-[var(--sf-brand)] bg-[var(--sf-brand)] text-white"
-                    : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                }`}
-                onClick={() => setPage(n)}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--sf-border)] px-4 py-3 text-sm text-[var(--sf-muted)] sm:px-6">
+          <div className="flex flex-wrap items-center gap-3">
+            <span>
+              {filtered.length
+                ? `Showing ${pageStart} – ${pageEnd} of ${filtered.length}`
+                : "Showing 0 of 0"}
+            </span>
+            <label className="flex items-center gap-1.5 text-xs">
+              Per page
+              <select
+                className="rounded-md border border-[var(--sf-border)] bg-white px-2 py-1"
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
               >
-                {n + 1}
-              </button>
-            ))}
+                <option value={10}>10</option>
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </label>
+          </div>
+          <div className="flex gap-2">
             <button
               type="button"
-              className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
-              disabled={safePage >= pageCount - 1}
-              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-              aria-label="Next page"
+              className="sf-btn sf-btn-sm sf-btn-ghost"
+              disabled={safePage <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
             >
-              ›
+              Previous
+            </button>
+            <button
+              type="button"
+              className="sf-btn sf-btn-sm sf-btn-ghost"
+              disabled={safePage >= pageCount}
+              onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
+            >
+              Next
             </button>
           </div>
         </div>
@@ -679,7 +757,7 @@ export default function CustomersPage() {
                 <p className="mt-1 text-sm text-slate-500">
                   {editId
                     ? "Update this customer’s contact and credit details."
-                    : "Add a customer for credit sales and the receivables ledger."}
+                    : "Add a customer for credit sales and account balances."}
                 </p>
               </div>
 
@@ -687,44 +765,13 @@ export default function CustomersPage() {
                 onSubmit={save}
                 className="flex max-h-[min(40rem,calc(100vh-8rem))] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg"
               >
-                {error && (
+                {error ? (
                   <p className="shrink-0 border-b border-rose-100 bg-rose-50 px-5 py-3 text-sm text-rose-700">
                     {error}
                   </p>
-                )}
+                ) : null}
 
                 <div className="min-h-0 flex-1 space-y-0 divide-y divide-slate-100 overflow-y-auto">
-                  <div className="grid gap-3 px-5 py-5 sm:grid-cols-[8.5rem_minmax(0,1fr)] sm:items-center sm:gap-6">
-                    <span className="text-sm font-medium text-slate-700">Avatar</span>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <span
-                        className={`inline-flex h-14 w-14 items-center justify-center rounded-full border-2 border-dashed border-slate-200 text-sm font-bold ${
-                          form.name.trim()
-                            ? avatarTone(editId || form.name)
-                            : "bg-slate-50 text-slate-400"
-                        }`}
-                      >
-                        {form.name.trim() ? (
-                          initials(form.name)
-                        ) : (
-                          <svg
-                            className="h-6 w-6"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.5"
-                          >
-                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-                            <circle cx="9" cy="7" r="4" />
-                          </svg>
-                        )}
-                      </span>
-                      <p className="text-xs text-slate-500">
-                        Initials are shown from the customer name. Photos are not stored.
-                      </p>
-                    </div>
-                  </div>
-
                   <div className="grid gap-2 px-5 py-5 sm:grid-cols-[8.5rem_minmax(0,1fr)] sm:items-center sm:gap-6">
                     <label htmlFor="customer-name" className="text-sm font-medium text-slate-700">
                       Name
@@ -784,7 +831,34 @@ export default function CustomersPage() {
                   </div>
 
                   <div className="grid gap-2 px-5 py-5 sm:grid-cols-[8.5rem_minmax(0,1fr)] sm:items-start sm:gap-6">
-                    <span className="pt-2.5 text-sm font-medium text-slate-700">Credit</span>
+                    <span className="pt-2.5 text-sm font-medium text-slate-700">
+                      Store credit
+                    </span>
+                    <div>
+                      <label htmlFor="customer-store-credit" className="sr-only">
+                        Store credit
+                      </label>
+                      <input
+                        id="customer-store-credit"
+                        className="block w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:border-sky-400 focus:ring-4 focus:ring-sky-100 disabled:bg-slate-50 disabled:text-slate-400"
+                        placeholder="Prepaid balance (KSh)"
+                        inputMode="decimal"
+                        value={form.storeCredit}
+                        onChange={(e) => setForm({ ...form, storeCredit: e.target.value })}
+                        disabled={Boolean(editId && editOwes)}
+                      />
+                      <p className="mt-1.5 text-xs text-slate-400">
+                        {editId && editOwes
+                          ? "Clear their outstanding balance first (or overpay on their account). Then you can set prepaid credit here."
+                          : "Prepaid top-up the customer can use on future sales. Separate from credit limit."}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2 px-5 py-5 sm:grid-cols-[8.5rem_minmax(0,1fr)] sm:items-start sm:gap-6">
+                    <span className="pt-2.5 text-sm font-medium text-slate-700">
+                      Credit limit
+                    </span>
                     <div className="space-y-2">
                       <div className="grid gap-2 sm:grid-cols-2">
                         <div>
@@ -794,7 +868,7 @@ export default function CustomersPage() {
                           <input
                             id="customer-limit"
                             className="block w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
-                            placeholder="Credit limit (KSh)"
+                            placeholder="Max they may owe (KSh)"
                             inputMode="decimal"
                             value={form.creditLimit}
                             onChange={(e) => setForm({ ...form, creditLimit: e.target.value })}
@@ -820,7 +894,7 @@ export default function CustomersPage() {
                         </div>
                       </div>
                       <p className="text-xs text-slate-400">
-                        Limit of 0 means no credit cap. Price level adjusts POS sell prices.
+                        Credit limit is how much they may owe. Store credit is money already paid in.
                       </p>
                     </div>
                   </div>

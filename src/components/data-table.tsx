@@ -12,6 +12,9 @@ export type DataTableColumn<T> = {
   sortable?: boolean;
 };
 
+const btnGhost =
+  "rounded-lg border border-[var(--sf-border)] bg-white px-2.5 py-1 text-xs font-medium text-[var(--sf-brand)] hover:bg-[var(--sf-surface-2)] disabled:opacity-40";
+
 export function DataTable<T extends { id?: string }>({
   rows,
   columns,
@@ -20,6 +23,7 @@ export function DataTable<T extends { id?: string }>({
   empty = "No rows",
   exportName,
   toolbar,
+  embedded = false,
 }: {
   rows: T[];
   columns: DataTableColumn<T>[];
@@ -29,6 +33,8 @@ export function DataTable<T extends { id?: string }>({
   /** When set, shows Export CSV using this filename stem. */
   exportName?: string;
   toolbar?: React.ReactNode;
+  /** Drop outer card chrome when nested in a parent panel. */
+  embedded?: boolean;
 }) {
   const [q, setQ] = useState("");
   const [sortKey, setSortKey] = useState<string | null>(null);
@@ -119,7 +125,7 @@ export function DataTable<T extends { id?: string }>({
           {exportName && (
             <button
               type="button"
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-40"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--sf-border)] bg-white px-3 py-1.5 text-xs font-semibold text-[var(--sf-brand)] shadow-sm hover:bg-[var(--sf-surface-2)] disabled:opacity-40"
               disabled={!filtered.length}
               onClick={exportCsv}
             >
@@ -141,23 +147,29 @@ export function DataTable<T extends { id?: string }>({
         )}
       </div>
 
-      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      <div
+        className={
+          embedded
+            ? "overflow-hidden"
+            : "overflow-hidden rounded-xl border border-[var(--sf-border)] bg-white shadow-sm"
+        }
+      >
         <div className="overflow-x-auto">
           <table className="w-full min-w-[720px] text-sm">
             <thead>
-              <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-medium text-slate-500">
+              <tr className="border-b border-slate-100 bg-[var(--sf-surface-2)]/80 text-left text-[10px] font-bold uppercase tracking-wider text-[var(--sf-muted)]">
                 {columns.map((c) => {
                   const sortable = c.sortable !== false;
                   const active = sortKey === String(c.key);
                   return (
                     <th
                       key={String(c.key)}
-                      className={`px-4 py-3 font-medium ${c.className || ""}`}
+                      className={`px-4 py-3 ${c.className || ""}`}
                     >
                       {sortable ? (
                         <button
                           type="button"
-                          className="inline-flex items-center gap-1 hover:text-slate-800"
+                          className="inline-flex items-center gap-1 hover:text-[var(--sf-brand)]"
                           onClick={() => toggleSort(String(c.key), sortable)}
                         >
                           {c.label}
@@ -177,14 +189,14 @@ export function DataTable<T extends { id?: string }>({
               {pageRows.map((row, i) => (
                 <tr
                   key={(row.id as string) || i}
-                  className={`border-b border-slate-50 hover:bg-slate-50/90 ${
-                    i % 2 === 1 ? "bg-slate-50/40" : "bg-white"
+                  className={`border-b border-slate-50 text-[var(--sf-brand)] hover:bg-[var(--sf-surface-2)]/70 ${
+                    i % 2 === 1 ? "bg-[var(--sf-surface-2)]/35" : "bg-white"
                   }`}
                 >
                   {columns.map((c) => (
                     <td
                       key={String(c.key)}
-                      className={`px-4 py-3 ${c.className || ""}`}
+                      className={`px-4 py-3 text-xs ${c.className || ""}`}
                     >
                       {c.render
                         ? c.render(row)
@@ -199,7 +211,7 @@ export function DataTable<T extends { id?: string }>({
                 <tr>
                   <td
                     colSpan={columns.length}
-                    className="px-4 py-12 text-center text-slate-500"
+                    className="px-4 py-12 text-center text-sm text-[var(--sf-muted)]"
                   >
                     {empty}
                   </td>
@@ -209,15 +221,15 @@ export function DataTable<T extends { id?: string }>({
           </table>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-sm text-slate-500">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-xs text-[var(--sf-muted)]">
           <div className="flex items-center gap-2">
             <span>
               Showing {from} to {to} of {filtered.length}
             </span>
-            <label className="flex items-center gap-1.5 text-xs">
+            <label className="flex items-center gap-1.5">
               Rows
               <select
-                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs"
+                className="rounded-md border border-[var(--sf-border)] bg-white px-2 py-1 text-xs text-[var(--sf-brand)]"
                 value={size}
                 onChange={(e) => {
                   setSize(Number(e.target.value));
@@ -233,28 +245,23 @@ export function DataTable<T extends { id?: string }>({
             </label>
           </div>
           <div className="flex gap-1.5">
-            <button
-              type="button"
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 disabled:opacity-40"
-              disabled={safePage <= 0}
-              onClick={() => setPage(0)}
-            >
+            <button type="button" className={btnGhost} disabled={safePage <= 0} onClick={() => setPage(0)}>
               First
             </button>
             <button
               type="button"
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 disabled:opacity-40"
+              className={btnGhost}
               disabled={safePage <= 0}
               onClick={() => setPage((p) => Math.max(0, p - 1))}
             >
               Prev
             </button>
-            <span className="self-center px-1 text-xs tabular-nums">
+            <span className="self-center px-1 font-mono text-xs tabular-nums text-[var(--sf-brand)]">
               {safePage + 1} / {pageCount}
             </span>
             <button
               type="button"
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 disabled:opacity-40"
+              className={btnGhost}
               disabled={safePage >= pageCount - 1}
               onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
             >
@@ -262,7 +269,7 @@ export function DataTable<T extends { id?: string }>({
             </button>
             <button
               type="button"
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 disabled:opacity-40"
+              className={btnGhost}
               disabled={safePage >= pageCount - 1}
               onClick={() => setPage(pageCount - 1)}
             >

@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --sf-bg: #f5f6f8;
   --sf-bg-accent: #eef0f4;
@@ -32,6 +34,83 @@
   --sf-inset: inset 0 1px 0 rgb(255 255 255 / 80%);
   --background: var(--sf-bg);
   --foreground: var(--sf-text);
+}
+
+html.dark,
+html[data-theme="dark"] {
+  --sf-bg: #0b1220;
+  --sf-bg-accent: #111827;
+  --sf-surface: #111827;
+  --sf-surface-2: #1a2333;
+  --sf-sidebar: #020617;
+  --sf-sidebar-2: #0b1220;
+  --sf-sidebar-muted: #94a3b8;
+  --sf-sidebar-hover: #1e293b;
+  --sf-brand: #e2e8f0;
+  --sf-brand-soft: #cbd5e1;
+  --sf-accent: #f97316;
+  --sf-accent-deep: #fb923c;
+  --sf-accent-soft: color-mix(in oklab, var(--sf-accent) 22%, #111827);
+  --sf-border: #243044;
+  --sf-border-strong: #334155;
+  --sf-text: #e2e8f0;
+  --sf-muted: #94a3b8;
+  --sf-shadow:
+    0 1px 2px rgb(0 0 0 / 35%),
+    0 4px 16px -4px rgb(0 0 0 / 45%);
+  --sf-shadow-lg:
+    0 2px 4px rgb(0 0 0 / 35%),
+    0 16px 40px -12px rgb(0 0 0 / 55%);
+  --sf-inset: inset 0 1px 0 rgb(255 255 255 / 4%);
+  --background: var(--sf-bg);
+  --foreground: var(--sf-text);
+  color-scheme: dark;
+}
+
+/* Remap hard-coded light utilities so the whole app follows theme tokens */
+html.dark .bg-white,
+html[data-theme="dark"] .bg-white,
+html.dark .odd\:bg-white:nth-child(odd),
+html[data-theme="dark"] .odd\:bg-white:nth-child(odd) {
+  background-color: var(--sf-surface);
+}
+html.dark .bg-slate-50,
+html[data-theme="dark"] .bg-slate-50,
+html.dark .even\:bg-slate-50\/60:nth-child(even),
+html[data-theme="dark"] .even\:bg-slate-50\/60:nth-child(even),
+html.dark .hover\:bg-slate-50:hover,
+html[data-theme="dark"] .hover\:bg-slate-50:hover,
+html.dark .hover\:bg-slate-100\/70:hover,
+html[data-theme="dark"] .hover\:bg-slate-100\/70:hover,
+html.dark .bg-slate-100,
+html[data-theme="dark"] .bg-slate-100 {
+  background-color: var(--sf-surface-2);
+}
+html.dark .border-slate-100,
+html[data-theme="dark"] .border-slate-100,
+html.dark .border-slate-200,
+html[data-theme="dark"] .border-slate-200,
+html.dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]),
+html[data-theme="dark"] .divide-slate-100 > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--sf-border);
+}
+html.dark .text-slate-900,
+html[data-theme="dark"] .text-slate-900,
+html.dark .text-slate-800,
+html[data-theme="dark"] .text-slate-800,
+html.dark .text-slate-700,
+html[data-theme="dark"] .text-slate-700 {
+  color: var(--sf-text);
+}
+html.dark .text-slate-600,
+html[data-theme="dark"] .text-slate-600,
+html.dark .text-slate-500,
+html[data-theme="dark"] .text-slate-500,
+html.dark .text-slate-400,
+html[data-theme="dark"] .text-slate-400,
+html.dark .text-slate-300,
+html[data-theme="dark"] .text-slate-300 {
+  color: var(--sf-muted);
 }
 
 @theme inline {
@@ -71,7 +150,7 @@
 .sf-card {
   border: 1px solid var(--sf-border);
   border-radius: var(--sf-radius);
-  background: #ffffff;
+  background: var(--sf-surface);
   box-shadow: var(--sf-shadow);
 }
 
@@ -79,16 +158,14 @@
   overflow: hidden;
   border: 1px solid var(--sf-border);
   border-radius: var(--sf-radius);
-  background: #f8fafc;
+  background: var(--sf-surface-2);
   box-shadow: var(--sf-shadow);
 }
 
 .sf-panel {
   border: 1px solid var(--sf-border);
   border-radius: var(--sf-radius);
-  background:
-    linear-gradient(145deg, rgb(255 255 255 / 82%), rgb(248 250 252 / 92%)),
-    var(--sf-surface-2);
+  background: var(--sf-surface);
   box-shadow: var(--sf-inset), var(--sf-shadow);
 }
 
@@ -123,7 +200,7 @@
 .sf-btn-primary {
   border: 1px solid var(--sf-brand);
   background: var(--sf-brand);
-  color: #fff;
+  color: var(--sf-surface);
   box-shadow: none;
 }
 
@@ -145,15 +222,15 @@
 }
 
 .sf-btn-ghost {
-  border: 1px solid #d5dee9;
-  background: #fff;
+  border: 1px solid var(--sf-border);
+  background: var(--sf-surface);
   color: var(--sf-text);
   box-shadow: none;
 }
 
 .sf-btn-ghost:hover {
-  background: #f8fafc;
-  border-color: #94a3b8;
+  background: var(--sf-surface-2);
+  border-color: var(--sf-border-strong);
 }
 
 .sf-btn-danger {
@@ -183,13 +260,47 @@
   transition: box-shadow 0.15s ease, border-color 0.15s ease;
 }
 
-.sf-input.sf-input-compact {
-  width: 5rem !important;
-  min-width: 5rem;
+.sf-input.sf-input-compact,
+.sf-input.sf-input-compact-wide {
+  box-sizing: border-box;
+  width: 100% !important;
+  min-width: 0;
+  max-width: 100%;
   min-height: 2rem;
-  padding: 0.35rem 0.5rem;
-  text-align: center;
+  height: 2rem;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
+}
+
+.sf-input.sf-input-compact {
+  text-align: center;
+}
+
+.sf-input.sf-input-compact-wide {
+  text-align: end;
+}
+
+.sf-input.sf-input-compact::-webkit-outer-spin-button,
+.sf-input.sf-input-compact::-webkit-inner-spin-button,
+.sf-input.sf-input-compact-wide::-webkit-outer-spin-button,
+.sf-input.sf-input-compact-wide::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.sf-input.sf-input-compact[type="number"],
+.sf-input.sf-input-compact-wide[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.sf-input.sf-input-serial {
+  min-height: 3.25rem;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .sf-qty {
@@ -198,7 +309,7 @@
   overflow: hidden;
   border: 1.5px solid var(--sf-border-strong);
   border-radius: var(--sf-radius-sm);
-  background: #fff;
+  background: var(--sf-surface);
   box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
 }
 
@@ -208,7 +319,7 @@
   width: 1.85rem;
   height: 1.85rem;
   border: 0;
-  background: #f8fafc;
+  background: var(--sf-surface-2);
   color: var(--sf-brand);
   font-size: 1rem;
   font-weight: 600;
@@ -230,7 +341,7 @@
   height: 1.85rem;
   border: 0;
   border-inline: 1px solid var(--sf-border);
-  background: #fff;
+  background: var(--sf-surface);
   text-align: center;
   font-size: 0.875rem;
   font-weight: 600;
@@ -255,7 +366,7 @@
   overflow: hidden;
   border: 1.5px solid var(--sf-border-strong);
   border-radius: 0.4rem;
-  background: #fff;
+  background: var(--sf-surface);
 }
 
 .sf-qty-compact button {
@@ -302,7 +413,7 @@
   min-width: 2.5rem;
   min-height: 2rem;
   border: 0;
-  background: #fff;
+  background: var(--sf-surface);
   text-align: center;
   font-size: 0.8125rem;
   font-weight: 700;
@@ -337,7 +448,7 @@
   gap: 0.25rem;
   border: 1.5px solid var(--sf-border-strong);
   border-radius: 0.4rem;
-  background: #fff;
+  background: var(--sf-surface);
   overflow: hidden;
 }
 
@@ -470,7 +581,7 @@
   overflow: hidden;
   border: 1px solid #d5dee9;
   border-radius: 0.5rem;
-  background: #fff;
+  background: var(--sf-surface);
 }
 
 .sf-search:focus-within {
@@ -730,7 +841,7 @@ select.sf-input {
 }
 
 .sf-pos-chip-off {
-  background: #fff;
+  background: var(--sf-surface);
   color: var(--sf-brand);
   border: 1px solid var(--sf-border);
 }
@@ -742,7 +853,7 @@ select.sf-input {
 .sf-pos-panel {
   border: 1px solid var(--sf-border);
   border-radius: 0.65rem;
-  background: #fff;
+  background: var(--sf-surface);
   min-width: 0;
   overflow: hidden;
 }
@@ -771,7 +882,7 @@ select.sf-input {
   padding: 0 0.65rem 0 2.2rem;
   border: 1.5px solid var(--sf-border-strong);
   border-radius: 0.5rem;
-  background: #fff;
+  background: var(--sf-surface);
   font-size: 0.8125rem;
   color: var(--sf-brand);
 }
@@ -817,7 +928,7 @@ select.sf-input {
 }
 
 .sf-pos-seg button[data-on="true"] {
-  background: #fff;
+  background: var(--sf-surface);
   color: var(--sf-brand);
   box-shadow: 0 1px 2px rgb(27 36 48 / 14%);
 }
@@ -829,7 +940,7 @@ select.sf-input {
   font-size: 0.75rem;
   font-weight: 600;
   border: 1.5px solid var(--sf-border);
-  background: #fff;
+  background: var(--sf-surface);
   color: var(--sf-brand);
 }
 
@@ -902,7 +1013,7 @@ select.sf-input {
   width: 1.1rem;
   height: 1.1rem;
   border-radius: 999px;
-  background: #fff;
+  background: var(--sf-surface);
   transition: transform 0.15s ease;
   box-shadow: 0 1px 2px rgb(0 0 0 / 20%);
 }
@@ -942,7 +1053,7 @@ select.sf-input {
   padding: 2mm 1mm;
   overflow: hidden;
   color: #000;
-  background: #fff;
+  background: var(--sf-surface);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
   font-size: 11px;
   line-height: 1.3;
@@ -966,7 +1077,7 @@ select.sf-input {
   padding: 1.25rem;
   border: 1px solid var(--sf-border);
   border-radius: 0.75rem;
-  background: #fff;
+  background: var(--sf-surface);
   color: var(--sf-brand);
   box-shadow: var(--sf-shadow);
 }
@@ -1137,5 +1248,34 @@ select.sf-input {
 
   .print-only {
     display: block !important;
+  }
+}
+
+@keyframes login-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes login-tilt {
+  0%,
+  100% {
+    transform: rotate(-4deg);
+  }
+  50% {
+    transform: rotate(3deg);
+  }
+}
+
+@keyframes login-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }

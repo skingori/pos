@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma, withTransaction } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canChangePrice, canSellCredit } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { roundMoney } from "@/lib/money";
 import { initiateStkPush } from "@/lib/mpesa";
 import { writeAudit } from "@/lib/audit";
@@ -25,7 +25,28 @@ type CartLine = {
 export async function GET(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (
+    !hasPermission(user, "sales.view") &&
+    !hasPermission(user, "receipts.access") &&
+    !hasPermission(user, "pos.access")
+  ) {
+    return forbidden();
+  }
   const sp = req.nextUrl.searchParams;
+  const id = sp.get("id") || sp.get("saleId");
+  if (id) {
+    const sale = await prisma.sale.findUnique({
+      where: { id },
+      include: {
+        customer: true,
+        cashier: true,
+        lines: true,
+        payments: true,
+      },
+    });
+    return NextResponse.json(sale ? [sale] : []);
+  }
+
   const q = sp.get("q")?.trim();
   const from = sp.get("from");
   const to = sp.get("to");
@@ -146,6 +167,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "pos.access")) return forbidden();
 
   const body = await req.json();
   const lines: CartLine[] = body.lines || [];
@@ -159,12 +181,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Cart is empty" }, { status: 400 });
   }
 
-  if (discount > 0 && !canChangePrice(user.role)) {
+  if (discount > 0 && !hasPermission(user, "price.override")) {
     return forbidden();
   }
 
   const hasCredit = payments.some((p) => p.method === "CREDIT");
-  if (hasCredit && !canSellCredit(user.role)) return forbidden();
+  if (hasCredit && !hasPermission(user, "sales.credit")) return forbidden();
 
   const branchId = await resolveBranchId(user);
   const [session, settings, customer, promotions] = await Promise.all([
@@ -250,11 +272,11 @@ export async function POST(req: NextRequest) {
     }
 
     let unitPrice =
-      line.unitPrice != null && canChangePrice(user.role)
+      line.unitPrice != null && hasPermission(user, "price.override")
         ? Number(line.unitPrice)
         : product.sellPrice;
 
-    if (!(line.unitPrice != null && canChangePrice(user.role)) && levelDiscount > 0) {
+    if (!(line.unitPrice != null && hasPermission(user, "price.override")) && levelDiscount > 0) {
       unitPrice = roundMoney(unitPrice * (1 - levelDiscount / 100));
     }
 

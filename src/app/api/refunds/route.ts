@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canApproveRefund } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import { writeAudit } from "@/lib/audit";
 import { roundMoney } from "@/lib/money";
 import { PaymentMethod, ReturnCondition } from "@prisma/client";
@@ -17,6 +17,9 @@ const PAYOUTS = new Set(["CASH", "MPESA", "CREDIT"]);
 export async function GET() {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "refunds.request") && !hasPermission(user, "refunds.approve")) {
+    return forbidden();
+  }
   const refunds = await prisma.refundRequest.findMany({
     include: {
       sale: { include: { customer: true, payments: true } },
@@ -38,6 +41,7 @@ function parsePayout(raw: unknown): PaymentMethod {
 export async function POST(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
+  if (!hasPermission(user, "refunds.request")) return forbidden();
   const body = await req.json();
 
   const sale = await prisma.sale.findUnique({
@@ -113,7 +117,7 @@ export async function POST(req: NextRequest) {
     });
 
     const amount = roundMoney(refundLines.reduce((s, l) => s + l.amount, 0));
-    const autoApprove = canApproveRefund(user.role);
+    const autoApprove = hasPermission(user, "refunds.approve");
 
     const refund = await prisma.refundRequest.create({
       data: {
@@ -167,7 +171,7 @@ export async function POST(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canApproveRefund(user.role)) return forbidden();
+  if (!hasPermission(user, "refunds.approve")) return forbidden();
 
   const body = await req.json();
   const refund = await prisma.refundRequest.findUnique({

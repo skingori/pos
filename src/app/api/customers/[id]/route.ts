@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { apiUser, unauthorized, forbidden } from "@/lib/api-auth";
-import { canManageInventory, canSellCredit } from "@/lib/permissions";
+import { hasPermission } from "@/lib/permissions";
 import {
   buildCustomerLedger,
   getCustomerOpenCharges,
   reconcileCustomerBalance,
+  setCustomerStoreCredit,
 } from "@/lib/customer-account";
 import { roundMoney } from "@/lib/money";
 import { zodErrorResponse } from "@/lib/api";
@@ -73,7 +74,7 @@ export async function PATCH(
 ) {
   const user = await apiUser();
   if (!user) return unauthorized();
-  if (!canManageInventory(user.role) && !canSellCredit(user.role)) return forbidden();
+  if (!hasPermission(user, "customers.access")) return forbidden();
 
   const { id } = await ctx.params;
   try {
@@ -83,10 +84,34 @@ export async function PATCH(
         phone: z.string().nullable().optional(),
         email: z.string().nullable().optional(),
         creditLimit: z.number().min(0).optional(),
+        storeCredit: z.number().min(0).optional(),
         priceLevelId: z.string().nullable().optional(),
         active: z.boolean().optional(),
       })
       .parse(await req.json());
+
+    const canSetLimit =
+      hasPermission(user, "customers.credit_limit") ||
+      hasPermission(user, "customers.access");
+
+    if (body.storeCredit !== undefined) {
+      try {
+        await setCustomerStoreCredit({
+          customerId: id,
+          targetCredit: body.storeCredit,
+          userId: user.id,
+          note: "Edited on customer profile",
+        });
+      } catch (err) {
+        return NextResponse.json(
+          {
+            error:
+              err instanceof Error ? err.message : "Could not update store credit",
+          },
+          { status: 400 }
+        );
+      }
+    }
 
     const customer = await prisma.customer.update({
       where: { id },
@@ -94,7 +119,9 @@ export async function PATCH(
         name: body.name,
         phone: body.phone,
         email: body.email,
-        creditLimit: body.creditLimit,
+        ...(canSetLimit && body.creditLimit !== undefined
+          ? { creditLimit: body.creditLimit }
+          : {}),
         priceLevelId: body.priceLevelId,
         active: body.active,
       },
@@ -106,7 +133,14 @@ export async function PATCH(
       action: "UPDATE",
       entity: "Customer",
       entityId: customer.id,
-      detail: body.active === false ? "deactivate" : body.active === true ? "activate" : "edit",
+      detail:
+        body.storeCredit !== undefined
+          ? `edit store credit ${body.storeCredit}`
+          : body.active === false
+            ? "deactivate"
+            : body.active === true
+              ? "activate"
+              : "edit",
     });
 
     return NextResponse.json(customer);

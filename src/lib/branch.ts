@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { Role } from "@prisma/client";
 import { prisma } from "./prisma";
+import { hasPermission } from "./permissions";
 
 export const BRANCH_COOKIE = "sf_branch";
 export const MAIN_BRANCH_CODE = "BR0001";
@@ -27,6 +28,7 @@ type ResolveUser = {
   id: string;
   role: Role;
   branchId?: string | null;
+  permissions?: string[] | null;
 };
 
 export async function resolveBranchId(user: ResolveUser): Promise<string> {
@@ -39,7 +41,7 @@ export async function resolveBranchId(user: ResolveUser): Promise<string> {
   });
   if (open?.branchId) return open.branchId;
 
-  if (user.role === Role.ADMIN || user.role === Role.MANAGER) {
+  if (canSwitchBranch(user)) {
     const jar = await cookies();
     const fromCookie = jar.get(BRANCH_COOKIE)?.value;
     if (fromCookie) {
@@ -67,6 +69,13 @@ export async function resolveBranch(user: ResolveUser) {
   return branch;
 }
 
-export function canSwitchBranch(role: Role) {
-  return role === Role.ADMIN || role === Role.MANAGER;
+export function canSwitchBranch(user: { role: Role; permissions?: string[] | null } | Role) {
+  if (typeof user === "string") {
+    return user === Role.ADMIN || user === Role.MANAGER;
+  }
+  return (
+    user.role === Role.ADMIN ||
+    user.role === Role.MANAGER ||
+    hasPermission(user, "branches.manage")
+  );
 }
